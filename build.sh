@@ -533,7 +533,7 @@ while [[ $# -gt 0 ]]; do
       # <host> <datei> -- ersetzt build_wrapper.sh:mv_to_laptop. Braucht
       # ZWEI Argumente, deshalb eigens abgefangen statt ueber add_target.
       [[ -n ${2:-} && -n ${3:-} ]] || {
-        err "--move-to braucht Host UND Datei:  build.sh --move-to windows builds/android/x_bookmark_manager.apk"
+        err "--move-to braucht Host UND Datei:  build.sh --move-to windows builds/apk/x_bookmark_manager.apk"
         exit 2; }
       MOVE_TO_MODE=1; MOVE_TO_HOST=$2; MOVE_TO_DATEI=$3
       shift 3 ;;
@@ -3843,6 +3843,25 @@ bau_eval() {                      # bau_eval <phase: konfigurieren|bauen> <urspr
 # publish_release.sh/--publish) wird geholt und an die Stelle gelegt, wo
 # es normalerweise nach einem Bau laege (builds/<ordner>/) -- danach kann
 # RUN_CMD unveraendert darauf zugreifen, egal ob hier je gebaut wurde.
+# RELEASE-NAME EINES ZIELS -- dieselbe Regel wie in publish_release.sh.
+xbm_release_name() {              # xbm_release_name <ziel> <ersatz-ordner>
+  local w=() i args=()
+  read -ra w <<< "${PUBLISH_CMD[$1]:-}"
+  for (( i = 0; i < ${#w[@]}; i++ )); do
+    if [[ ${w[$i]} == publish_release.sh || ${w[$i]} == */publish_release.sh ]]; then
+      args=("${w[@]:i+1}")
+      break
+    fi
+  done
+  if (( ${#args[@]} >= 2 )); then
+    printf '%s\n' "${args[0]}"
+  elif (( ${#args[@]} == 1 )); then
+    basename -- "${args[0]%/}"
+  else
+    basename -- "${2%/}"
+  fi
+}
+
 xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
   local target=$1
   local konfig=config/release.conf
@@ -3871,17 +3890,19 @@ xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
   #     Anteil daraus (z.B. "builds/android" aus
   #     ".../builds/android/x_bookmark_manager.apk") ist genau der
   #     Ordner, in den ein heruntergeladenes Release ebenso gehoert.]
-  local plattform=${RELEASE_NAME[$target]:-}
-  if [[ -z $plattform ]]; then
-    err "  --run-only: RELEASE_NAME[$target] ist in config/targets.conf nicht eingetragen"
-    return 1
-  fi
+  # [RELEASE_NAME[] gibt es nicht mehr: der Release-Name ist der Name des
+  #  Bauordners, genau wie publish_release.sh ihn vergibt. Er wird deshalb
+  #  aus PUBLISH_CMD[ziel] nach derselben Regel bestimmt:
+  #      publish_release.sh builds/deb-asan              -> "deb-asan"
+  #      publish_release.sh linux-debug builds/deb-asan  -> "linux-debug"
+  #  Ohne PUBLISH_CMD: Ordner aus DOWNLOAD[ziel], sonst builds/<ziel>.]
   local ordner
   if [[ -n ${DOWNLOAD[$target]:-} ]]; then
     ordner=$(dirname "${DOWNLOAD[$target]}")
   else
     ordner="builds/$target"   # Ruecksicht: kein DOWNLOAD[] gepflegt -- ueblicher Ort raten
   fi
+  local plattform; plattform=$(xbm_release_name "$target" "$ordner")
 
   local arbeitsordner; arbeitsordner=$(mktemp -d) || return 1
   # shellcheck disable=SC2064
@@ -4494,9 +4515,9 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
       elif [[ -n ${PUBLISH_CMD[$target]:-} ]]; then
         log "  Veroeffentliche: ${PUBLISH_CMD[$target]}"
         lauf_notiz "${target}@${host}" publish "-" gestartet
-        # XBM_TARGET exportieren -- publish_release.sh kann darueber (bei
-        # nur einem Argument, ohne ausdruecklichen Release-Namen)
-        # RELEASE_NAME[$target] selbst aus config/targets.conf lesen.
+        # XBM_TARGET steht Hooks und eigenen Skripten zur Verfuegung.
+        # (publish_release.sh braucht es nicht mehr: der Release-Name ist
+        # der Name des Bauordners.)
         if XBM_TARGET="$target" XBM_BAU_BEGINN="${bau_beginn:-0}" \
            eval "${PUBLISH_CMD[$target]}"; then
           lauf_notiz "${target}@${host}" publish "-" ok

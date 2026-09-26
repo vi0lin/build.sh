@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # publish_release.sh <build-ordner>
-#     -- Regelfall: der Veroeffentlichungs-Name kommt aus
-#        config/targets.conf (RELEASE_NAME[ziel]), ueber den Zielnamen,
-#        den build.sh beim Ausfuehren von PUBLISH_CMD automatisch als
-#        XBM_TARGET exportiert. Eingetragen in config/targets.conf:
-#            PUBLISH_CMD[deb]='./publish_release.sh builds/deb'
+#     -- Regelfall: der Release-Name ist der NAME DES ORDNERS.
+#            publish_release.sh builds/deb-asan    ->  "deb-asan"
+#        Die App sucht unter demselben Namen (CMake baut den Namen des
+#        Bauordners als XBM_RELEASE_NAME ein), beide passen also von selbst.
 #
 # publish_release.sh <name> <build-ordner> [version]
-#     -- ausdruecklich, z.B. zum Testen von Hand ausserhalb von
-#        build.sh, oder um RELEASE_NAME[] fuer einen Lauf zu umgehen.
+#     -- Name ausdruecklich:
+#            publish_release.sh linux-debug builds/deb-asan  ->  "linux-debug"
+#        Die App muss dann mit  -DXBM_RELEASE_NAME=linux-debug  gebaut sein.
 #
 # Paketiert ein fertiges Release (Programmdatei + benoetigte data/) und
 # veroeffentlicht es ueber ein EIGENES, kleines Releases-Git-Repository --
@@ -31,32 +31,23 @@
 set -euo pipefail
 
 if (( $# == 1 )); then
-  # NUR DER BAU-ORDNER -- der Schluessel kommt aus config/targets.conf.
-  # [Absichtlich NICHTS ueber Zielnamen hier im Skript fest verdrahtet --
-  #  das soll fuer andere Projekte mit anderen Zielnamen unveraendert
-  #  nutzbar bleiben. XBM_TARGET setzt build.sh selbst, wenn es
-  #  PUBLISH_CMD ausfuehrt; von Hand aufgerufen musst du es selbst
-  #  davorsetzen (XBM_TARGET=deb ./publish_release.sh builds/deb) oder
-  #  gleich die Zwei-Argumente-Form nutzen.]
-  quelle=$1
+  # NUR DER BAU-ORDNER -- der Release-Name ist sein Name.
+  # [Vorher kam er aus RELEASE_NAME[] in config/targets.conf (deb ->
+  #  "linux", exe -> "windows" ...). Der Ordnername ist eindeutig, steht
+  #  schon im Aufruf und passt zu dem, was die App sucht.]
+  quelle=${1%/}
   version=""
-  : "${XBM_TARGET:?Nur ein Argument angegeben, aber XBM_TARGET ist nicht gesetzt. build.sh setzt das automatisch beim Ausfuehren von PUBLISH_CMD -- von Hand aufgerufen entweder \"XBM_TARGET=<ziel> davorsetzen\" oder \"publish_release.sh <name> <build-ordner>\" (zwei Argumente) verwenden.}"
-  [[ -f config/targets.conf ]] || {
-    echo "config/targets.conf fehlt -- wird fuer RELEASE_NAME[$XBM_TARGET] gebraucht" >&2
-    exit 1
-  }
-  declare -A RELEASE_NAME
-  # shellcheck disable=SC1091
-  source config/targets.conf
-  schluessel=${RELEASE_NAME[$XBM_TARGET]:-}
-  if [[ -z $schluessel ]]; then
-    echo "RELEASE_NAME[$XBM_TARGET] ist in config/targets.conf nicht eingetragen" >&2
+  schluessel=$(basename -- "$quelle")
+  if [[ -z $schluessel || $schluessel == . || $schluessel == / ]]; then
+    echo "Aus '$1' laesst sich kein Release-Name ableiten -- Ordner angeben" >&2
+    echo "(z.B. builds/deb) oder den Namen ausdruecklich:" >&2
+    echo "    publish_release.sh <name> <build-ordner>" >&2
     exit 1
   fi
 elif (( $# >= 2 )); then
-  # NAME UND PFAD AUSDRUECKLICH -- umgeht config/targets.conf komplett.
+  # NAME UND PFAD AUSDRUECKLICH.
   schluessel=$1
-  quelle=$2
+  quelle=${2%/}
   version=${3:-}
 else
   echo "Nutzung: publish_release.sh <build-ordner>" >&2
