@@ -2,6 +2,15 @@
 Bash-Script for building projects on different machines with nice to have features.
 The User Experience And Text Flushing On The Console Is Still Not Good - But It Works.
 
+# Installation
+```
+./build.sh --add-to-path
+# and then in any project directory with a properly setup config/ folder, you can run
+build.sh --help
+build.sh --show
+build.sh --publish target@host anothertarget@anotherhost
+```
+
 # Usage
 This Github Repo Delivers A ```config/``` Folder.
 Its An Example How To Set Projects Up For Running build.sh
