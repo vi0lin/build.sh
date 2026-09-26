@@ -155,6 +155,22 @@ xbm_selbst_ordner() {
   ( cd -P "$(dirname "$p")" && pwd -P )
 }
 
+# WERKZEUGE NEBEN build.sh IMMER FINDEN.
+# [targets.conf ruft publish_release.sh jetzt OHNE ./ auf, also ueber den
+#  PATH. Auf den anderen Rechnern startet build.sh aber ueber ssh als
+#  nicht-interaktive Shell -- die liest ~/.profile und ~/.bashrc NICHT,
+#  der Eintrag von --add-to-path greift dort also nicht. Deshalb nimmt
+#  build.sh seinen eigenen Ordner selbst vorne in den PATH: was neben ihm
+#  liegt, wird immer gefunden, und zwar genau die Fassung, die zu diesem
+#  build.sh gehoert.]
+if _xbm_eigen=$(xbm_selbst_ordner 2>/dev/null) && [[ -n $_xbm_eigen ]]; then
+  case ":$PATH:" in
+    *":$_xbm_eigen:"*) ;;
+    *) PATH="$_xbm_eigen:$PATH"; export PATH ;;
+  esac
+fi
+unset _xbm_eigen
+
 xbm_umgebung() {                  # -> windows | wsl | posix
   case $(uname -s 2>/dev/null) in
     MINGW*|MSYS*|CYGWIN*) echo windows; return ;;
@@ -3844,6 +3860,49 @@ bau_eval() {                      # bau_eval <phase: konfigurieren|bauen> <urspr
 # es normalerweise nach einem Bau laege (builds/<ordner>/) -- danach kann
 # RUN_CMD unveraendert darauf zugreifen, egal ob hier je gebaut wurde.
 # RELEASE-NAME EINES ZIELS -- dieselbe Regel wie in publish_release.sh.
+# DAS WERKZEUG SELBST ZUR GEGENSEITE SCHICKEN.
+# [build.sh und publish_release.sh liegen nicht mehr im Projekt, sondern
+#  als eigenes Werkzeug daneben (Commit "publish_release.sh outsourced").
+#  Die Gegenseite holt sich das Projekt per git -- und "git reset --hard"
+#  hat dort das alte build.sh geloescht, weil es nicht mehr im Repo ist.
+#  Danach lief jeder Fernbau ins Leere:
+#      windows:      /bin/bash: build.sh: No such file or directory
+#      buildserver:  sh: ./build.sh: not found
+#  Deshalb schickt die steuernde Seite vor jedem Fernbau IHRE Fassung mit.
+#  Nebeneffekt: drueben laeuft immer genau dieselbe Fassung wie hier --
+#  nie wieder "Fassung 2 drueben, Fassung 3 hier".
+#
+#  Dabei wird auch das alte Job-Protokoll drueben geloescht. [Sonst zeigte
+#  "Protokoll von dort" nach einem Fehlschlag das Protokoll des VORIGEN
+#  Laufs -- mit "Veroeffentlicht" am Ende, obwohl diesmal gar nichts lief.]
+xbm_werkzeug_senden() {           # xbm_werkzeug_senden <host> <pfad> <ziel>
+  local h=$1 p=$2 t=$3 dir befehl f
+  dir=$(xbm_selbst_ordner) || { err "  Werkzeugordner nicht ermittelbar"; return 1; }
+  local dateien=()
+  for f in build.sh publish_release.sh; do
+    [[ -f $dir/$f ]] && dateien+=("$f")
+  done
+  local altlog="builds/logs/${t}@local.log"
+  case ${HOST_OS[$h]:-posix} in
+    # chmod +x: publish_release.sh wird ueber den PATH aufgerufen und
+    # muss dafuer ausfuehrbar sein -- unabhaengig davon, welche Rechte die
+    # Dateien hier hatten.
+    cmd) befehl="cd /d $(winpfad "$p") && bash -c \"tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'\"" ;;
+    wsl) befehl="bash -c \"cd '$p' && tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'\"" ;;
+    *)   befehl="cd '$p' && tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'" ;;
+  esac
+  if (( DRY_RUN )); then
+    log "  [Probelauf] Werkzeug (${dateien[*]}) -> ${h}:$p"
+    return 0
+  fi
+  build_remote_argv "$h" "$befehl"
+  if ! tar -C "$dir" -czf - "${dateien[@]}" | "${SSH_ARGV[@]}" >/dev/null 2>&1; then
+    err "  Werkzeug (${dateien[*]}) liess sich nicht nach '${h}:$p' uebertragen"
+    return 1
+  fi
+  log "  Werkzeug -> $h: ${dateien[*]} (aus $dir)"
+}
+
 xbm_release_name() {              # xbm_release_name <ziel> <ersatz-ordner>
   local w=() i args=()
   read -ra w <<< "${PUBLISH_CMD[$1]:-}"
@@ -4926,6 +4985,8 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
 
   local path=${HOST_PATH[$host]}
 
+  xbm_werkzeug_senden "$host" "$path" "$target" || return 1
+
   # FASSUNG AUS DER FERNDATEI LESEN, bevor sie aufgerufen wird.
   # [Eine ALTE Fassung kennt weder --proto noch --chdir und bricht mit
   #  "unbekannte Option" ab -- die mitgereiste Nummer wird also nie
@@ -5056,7 +5117,9 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
       fernbefehl="cd /d $(winpfad "$path") && bash build.sh --run-id $XBM_LAUF_ID ${flags[*]}"
     fi
   else
-    fernbefehl="cd '$path' && ./build.sh ${flags[*]}"
+    # bash build.sh statt ./build.sh -- wie bei cmd/wsl; haengt so nicht
+    # vom Ausfuehrungsrecht der Datei ab.
+    fernbefehl="cd '$path' && bash build.sh ${flags[*]}"
   fi
   # UNMISSVERSTAENDLICH BESTAETIGEN, OB DER HOOK-TESTMODUS TATSAECHLICH
   # MITGEHT. [Die Kurzanzeige weiter unten kuerzt den Befehl auf einen
