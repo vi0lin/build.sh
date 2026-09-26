@@ -8,17 +8,18 @@ The User Experience And Text Flushing On The Console Is Still Not Good - But It 
 # and then in any project directory with a properly setup config/ folder, you can run
 build.sh --help
 build.sh --show
+```
 
+# Usage
+This Github Repo Delivers A ```config/``` Folder.
+Its An Example How To Set Projects Up For Running build.sh
+```
 # builds and pushes it to your releases.git
 build.sh --publish target@host anothertarget@anotherhost
 
 # only build
 build.sh target@host anothertarget@anotherhost
 ```
-
-# Usage
-This Github Repo Delivers A ```config/``` Folder.
-Its An Example How To Set Projects Up For Running build.sh
 
 # Features:
 * defining build targets for cmake
