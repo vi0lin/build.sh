@@ -784,7 +784,9 @@ Beispiele:
 config/hosts.conf   name | os | benutzer@host | pfad | passwort
                     os ist "posix" oder "windows"; Passwort leer lassen,
                     wenn ein SSH-Schluessel benutzt wird.
-config/targets.conf declare -A CONF_CMD BUILD_CMD RUN_CMD PUBLISH_CMD RELEASE_NAME
+config/targets.conf declare -A CONF_CMD BUILD_CMD RUN_CMD PUBLISH_CMD DOWNLOAD
+                    Release-Name = Name des Bauordners (builds/deb -> "deb").
+                    Vorlage: config/ im Repository von build.sh.
 EOF
       exit 0 ;;
     -*) err "unbekannte Option: $1"; exit 2 ;;
@@ -1111,7 +1113,12 @@ ssh_cmd() {                      # $1 = hostname -> setzt SSH_ARGV
 
 # Fuer rsync -e: EIN Wort mit dem Transportbefehl.
 rsh_string() {
-  local h=$1 pw=${HOST_PASS[$h]:-}
+  # [Zwei getrennte local-Zeilen: bei "local h=$1 pw=${HOST_PASS[$h]}"
+  #  expandiert Bash ALLE Woerter vor der ersten Zuweisung -- $h war dann
+  #  noch das h des AUFRUFERS (dynamischer Geltungsbereich). Je nach
+  #  Aufrufer kam so das Passwort eines ANDEREN Hosts oder gar keins.]
+  local h=$1
+  local pw=${HOST_PASS[$h]:-}
   if [[ -n $pw ]]; then printf 'sshpass -p %s ssh' "$pw"
   else                  printf 'ssh'; fi
 }
@@ -1913,7 +1920,8 @@ EXCLUDES=(--exclude '.git/' --exclude 'builds/' --exclude 'build-*/'
           --exclude 'CMakeFiles/' --exclude '.deps-cache/')
 
 push_project() {
-  local h=$1 path=${HOST_PATH[$h]}
+  local h=$1
+  local path=${HOST_PATH[$h]}   # getrennt -- siehe rsh_string
 
   # GIT STATT TAR/RSYNC.
   # [Sechstes Feld war "xfer" (rsync/tar); das SIEBTE ist jetzt eine
@@ -2305,13 +2313,15 @@ push_project() {
 #  Trennen mit Leerzeichen, Kommas oder Zeilenumbruechen; Ordner mit
 #  oder ohne / am Ende; * und ? sind erlaubt.]
 download_muster() {              # download_muster <ziel>
-  local t=$1 roh=${DOWNLOAD[$t]-}
+  local t=$1
+  local roh=${DOWNLOAD[$t]-}     # getrennt -- siehe rsh_string
   [[ -z $roh ]] && return 1
   printf '%s' "$roh" | tr ',\n\t' '   '
 }
 
 pull_artifacts() {
-  local h=$1 target=$2 path=${HOST_PATH[$h]}
+  local h=$1 target=$2
+  local path=${HOST_PATH[$h]}   # getrennt -- siehe rsh_string
   local muster
   if muster=$(download_muster "$target"); then
     # --- gezielt einzelne Dateien und Ordner ---------------------------
@@ -2424,7 +2434,8 @@ pull_artifacts() {
 #  Verzeichnis, statt zu einem sauberen Fehler oder einer korrekten
 #  Ordnerstruktur.]
 move_to_host() {                 # move_to_host <host> <datei>
-  local h=$1 datei=$2 path=${HOST_PATH[$h]:-}
+  local h=$1 datei=$2
+  local path=${HOST_PATH[$h]:-} # getrennt -- siehe rsh_string
   if [[ -z $path ]]; then
     err "  Host '$h' unbekannt -- siehe config/hosts.conf"
     return 1
@@ -5185,6 +5196,77 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
 #  Ausserdem schrieben alle Auftraege gleichzeitig ins Terminal, was den
 #  Balken zerriss. Jetzt bekommt jeder Auftrag seine eigene Logdatei.]
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# WARTEN INNERHALB EINES AUFTRAGS (statt in der Startschleife).
+# ---------------------------------------------------------------------------
+# xbm_auftrag_warten <idx> <host> <grenze> <braucht_platz> <deps> <statusdatei>
+#   deps: "idx:name idx:name ..." -- Auftraege, deren Ende abzuwarten ist.
+# Setzt XBM_WARTE_DEP_FEHLER (Name eines gescheiterten Vorgaengers oder
+# leer) und XBM_WARTE_SLOT (belegter Bauplatz, von xbm_auftrag_ende
+# wieder freigegeben). Laeuft IM Hintergrundprozess des Auftrags.
+xbm_auftrag_warten() {
+  local idx=$1 h=$2 grenze=$3 braucht_platz=$4 deps=$5 sdatei=$6
+  local ich="${TARGETS[$idx]}@${HOSTS[$idx]}"
+  XBM_WARTE_DEP_FEHLER=""
+  XBM_WARTE_SLOT=""
+
+  # 1) VORGAENGER ABWARTEN (nur --run-only: der Bau desselben Ziels).
+  local d didx dname offen rcwert p
+  while :; do
+    offen=""
+    for d in $deps; do
+      didx=${d%%:*}; dname=${d#*:}
+      [[ -f "$STATUS_DIR/.rc/$didx" ]] && continue
+      # Ohne .rc gestorben (hart beendet)? Dann nicht ewig warten.
+      if [[ -f "$STATUS_DIR/.pid/$didx" ]]; then
+        p=$(cat "$STATUS_DIR/.pid/$didx" 2>/dev/null)
+        if [[ -n $p ]] && ! kill -0 "$p" 2>/dev/null; then
+          echo 1 > "$STATUS_DIR/.rc/$didx"
+          continue
+        fi
+      fi
+      offen=$dname
+      break
+    done
+    [[ -z $offen ]] && break
+    printf '%s  wartet auf %s\n' "$ich" "$offen" > "$sdatei"
+    sleep 1
+  done
+  for d in $deps; do
+    didx=${d%%:*}; dname=${d#*:}
+    rcwert=$(cat "$STATUS_DIR/.rc/$didx" 2>/dev/null || echo 1)
+    if [[ ${rcwert:-1} != 0 ]]; then XBM_WARTE_DEP_FEHLER=$dname; break; fi
+  done
+
+  # 2) BAUPLATZ AUF DEM HOST BELEGEN.
+  # [mkdir ist atomar: von mehreren gleichzeitig Wartenden bekommt genau
+  #  einer denselben Platz -- ohne Sperrdatei, ohne Wettlauf. Ein Auftrag
+  #  mit Grenze N versucht die Plaetze 1..N.]
+  if (( braucht_platz )); then
+    local k
+    while :; do
+      for (( k = 1; k <= grenze; k++ )); do
+        if mkdir "$STATUS_DIR/.slots/$h.$k" 2>/dev/null; then
+          XBM_WARTE_SLOT="$STATUS_DIR/.slots/$h.$k"
+          break 2
+        fi
+      done
+      printf '%s  wartet auf freien Platz auf %s\n' "$ich" "$h" > "$sdatei"
+      sleep 1
+    done
+  fi
+  : > "$sdatei"
+  return 0
+}
+
+# xbm_auftrag_ende <idx> <host> <rc> -- Ergebnis fuer Abhaengige ablegen,
+# Bauplatz freigeben.
+xbm_auftrag_ende() {
+  echo "$3" > "$STATUS_DIR/.rc/$1"
+  [[ -n ${XBM_WARTE_SLOT:-} ]] && rmdir "$XBM_WARTE_SLOT" 2>/dev/null
+  return 0
+}
+
 run_all() {
   local total=${#TARGETS[@]}
   # SPERRDATEI FUER DIE GANZE LAUFZEIT.
@@ -5226,6 +5308,10 @@ run_all() {
   mkdir -p "$LOGDIR"
   STATUS_DIR="$LOGDIR/.status"
   rm -rf "$STATUS_DIR"; mkdir -p "$STATUS_DIR"
+  # .rc/<idx>   Rueckgabewert eines fertigen Auftrags (fuer Abhaengige)
+  # .pid/<idx>  Prozesskennung (erkennt einen Auftrag, der ohne .rc starb)
+  # .slots/     Bauplaetze je Host (siehe xbm_auftrag_warten)
+  mkdir -p "$STATUS_DIR/.rc" "$STATUS_DIR/.pid" "$STATUS_DIR/.slots"
   # LAUF_UEBERSICHT/KOPF_UEBERSICHT werden JETZT NICHT MEHR hier
   # eingerichtet -- das passiert bereits VOR diesem Aufruf (siehe ganz
   # unten im Skript, vor den "build.sh Fassung ..."-Kopfzeilen), damit
@@ -5254,82 +5340,17 @@ run_all() {
     #  nacheinander (Vorgabe, == --unparallel), bis zu 2 gleichzeitig auf
     #  "schlecht" -- die drei Gruppen dabei UNTEREINANDER voellig
     #  unabhaengig.]
-    while true; do
-      local laufend_hier=0 hidx
-      for hidx in "${!pid[@]}"; do
-        [[ ${host_of[$hidx]:-} == "$h" ]] || continue
-        [[ -n ${rc[$hidx]+x} ]] && continue   # schon abgewartet -- zaehlt nicht mehr
-        kill -0 "${pid[$hidx]}" 2>/dev/null && ((laufend_hier++))
-      done
-      (( laufend_hier < grenze )) && break
-      # Warten, bis IRGENDEIN Hintergrundauftrag fertig wird -- nicht
-      # zwingend einer auf DIESEM Host; danach wird oben einfach neu
-      # gezaehlt. Ein "falsches" Aufwachen (ein anderer Host wurde
-      # fertig) kostet nur eine zusaetzliche, billige Zaehlrunde.
-      wait -n 2>/dev/null || true
-      for hidx in "${!pid[@]}"; do
-        [[ -n ${rc[$hidx]+x} ]] && continue
-        kill -0 "${pid[$hidx]}" 2>/dev/null && continue
-        wait "${pid[$hidx]}" 2>/dev/null; rc[$hidx]=$?
-      done
-    done
-    local dep_fehler=""
-    # ABHAENGIGKEIT: --run-only WARTET auf das Bauen/Veroeffentlichen
-    # DESSELBEN ZIELS, wenn beides im selben Aufruf steht.
-    # [Beispiel:
-    #      ./build.sh --publish apk@buildserver --no-publish --run-only apk@windows
-    #  Der zweite Auftrag holt das VEROEFFENTLICHTE Release herunter --
-    #  das kann er erst, wenn der erste es hochgeladen hat. Ohne diese
-    #  Sperre startete er sofort und installierte den STAND VON VORHIN,
-    #  ohne dass irgendetwas auf einen Fehler hingewiesen haette: das
-    #  alte Release lag ja da, der Download gelang, die App wurde
-    #  installiert -- nur eben die vorige Fassung. Genau solche
-    #  "erfolgreichen" Laeufe mit falschem Ergebnis sind die
-    #  unangenehmsten.
-    #  Gewartet wird NUR auf Auftraege mit demselben ZIELNAMEN, die
-    #  wirklich bauen oder veroeffentlichen (nicht auf andere
-    #  --run-only-Auftraege -- sonst warteten zwei Installationen
-    #  desselben Ziels sinnlos aufeinander).]
-    if (( ${RUN_ONLY_JE_ZIEL[$idx]:-0} )); then
-      while true; do
-        local wartet_auf="" widx
-        for widx in "${!pid[@]}"; do
-          [[ ${target_of[$widx]:-} == "$t" ]] || continue
-          (( ${runonly_of[$widx]:-0} )) && continue   # selbst nur ein Lauf
-          [[ -n ${rc[$widx]+x} ]] && continue         # schon fertig
-          if kill -0 "${pid[$widx]}" 2>/dev/null; then
-            wartet_auf="${name[$widx]}"
-            break
-          fi
-        done
-        [[ -z $wartet_auf ]] && break
-        fortschritt "$(printf '\r  %s wartet auf %s ...   ' \
-                        "${t}@${h}" "$wartet_auf")"
-        wait -n 2>/dev/null || true
-        for widx in "${!pid[@]}"; do
-          [[ -n ${rc[$widx]+x} ]] && continue
-          kill -0 "${pid[$widx]}" 2>/dev/null && continue
-          wait "${pid[$widx]}" 2>/dev/null; rc[$widx]=$?
-        done
-      done
-      # WAR DER BAU UEBERHAUPT ERFOLGREICH?
-      # [Ohne diese Pruefung liefe die Installation auch nach einem
-      #  GESCHEITERTEN Bau weiter -- und spielte dann klaglos das ALTE,
-      #  noch im Releases-Repo liegende Paket auf. Das Protokoll haette
-      #  "OK" gemeldet, auf dem Geraet laege die vorige Fassung: ein
-      #  falsches Ergebnis, das wie ein Erfolg aussieht. Deshalb hier
-      #  abbrechen, mit klarer Begruendung.]
-      local widx2
-      for widx2 in "${!pid[@]}"; do
-        [[ ${target_of[$widx2]:-} == "$t" ]] || continue
-        (( ${runonly_of[$widx2]:-0} )) && continue
-        [[ -n ${rc[$widx2]+x} ]] || continue
-        if (( ${rc[$widx2]} != 0 )); then
-          dep_fehler="${name[$widx2]}"
-          break
-        fi
-      done
-    fi
+    # ALLE AUFTRAEGE SOFORT STARTEN -- GEWARTET WIRD IM AUFTRAG SELBST.
+    # [Vorher wartete HIER, in der Startschleife, jeder Auftrag auf einen
+    #  freien Platz auf seinem Host und (bei --run-only) auf den Bau
+    #  desselben Ziels. Das hielt die GANZE Schleife an -- und die
+    #  Live-Anzeige (zeichner_start) kommt erst nach ihr. Bei
+    #      --publish deb@local exe@windows apk@buildserver --run-only apk@windows
+    #  wartete apk@windows erst minutenlang auf exe@windows (gleicher Host)
+    #  und dann auf apk@buildserver, ohne jede Ausgabe: der Bildschirm blieb
+    #  bei "gestartet: 3/4" stehen und sah aus wie ein Haenger.
+    #  Jetzt startet jeder Auftrag sofort als Hintergrundprozess und wartet
+    #  dort selbst (xbm_auftrag_warten); seine Statuszeile zeigt, worauf.]
     local lf="$LOGDIR/${t}@${h}.log"
     local ziel=$lf
     # [Erst NACH der --no-log-Pruefung leeren: vorher blieb bei --no-log
@@ -5337,40 +5358,57 @@ run_all() {
     if (( NO_LOG )); then ziel=/dev/null; else : > "$lf"; fi
     local sdatei="$STATUS_DIR/$idx"
     : > "$sdatei"
-    if (( LOG_STDOUT )); then
-      # GENAU DER LOGINHALT, auch auf dem Bildschirm.
-      # [Erst stempeln, dann verteilen -- so ist die Bildschirmausgabe
-      #  Zeile fuer Zeile das, was auch in der Datei steht. Umgekehrt
-      #  (verteilen, dann zweimal stempeln) waeren es zwei getrennte
-      #  Uhrzeiten, die sich um Millisekunden unterscheiden.]
-      ( exec 3>&1
-        XBM_STATUS_DATEI="$sdatei" XBM_DEP_FEHLER="$dep_fehler" XBM_TUE_RUN="${RUN_JE_ZIEL[$idx]:-0}" XBM_TUE_RUN_ONLY="${RUN_ONLY_JE_ZIEL[$idx]:-0}" XBM_TUE_PUBLISH="${PUBLISH_JE_ZIEL[$idx]:-0}" do_one "$t" "$h" "$ej" 2>&1 \
-          | zeitstempel | tee "$ziel" >&3
-        exit ${PIPESTATUS[0]} ) &
-    elif (( VERBOSE )); then
-      # Volle Ausgabe auf BEIDES: Bildschirm und Log.
-      # Bei --show-output bekommt der Bildschirm die Zeilen OHNE
-      # Zeitstempel, die Datei MIT. [Am Bildschirm liest man mit, dort
-      # stoert die Uhrzeit; im Log will man sie spaeter zuordnen
-      # koennen.]
-      ( exec 3>&1
-        XBM_STATUS_DATEI="$sdatei" XBM_DEP_FEHLER="$dep_fehler" XBM_TUE_RUN="${RUN_JE_ZIEL[$idx]:-0}" XBM_TUE_RUN_ONLY="${RUN_ONLY_JE_ZIEL[$idx]:-0}" XBM_TUE_PUBLISH="${PUBLISH_JE_ZIEL[$idx]:-0}" do_one "$t" "$h" "$ej" 2>&1 \
-          | tee >(zeitstempel > "$ziel") >&3
-        exit ${PIPESTATUS[0]} ) &
-    else
-      # Volle Ausgabe nur ins Log; der Bildschirm bekommt ueber
-      # Kennung 3 nur den Fortschritt.
-      # Auch was die Unterschale SELBST meldet, gehoert ins Log.
-      # [Sonst landet eine Meldung von zeitstempel oder tee mitten in der
-      #  Statusflaeche und verschiebt sie.]
-      ( exec 3>&1
-        exec 2>>"$ziel"
-        XBM_STATUS_DATEI="$sdatei" XBM_DEP_FEHLER="$dep_fehler" XBM_TUE_RUN="${RUN_JE_ZIEL[$idx]:-0}" XBM_TUE_RUN_ONLY="${RUN_ONLY_JE_ZIEL[$idx]:-0}" XBM_TUE_PUBLISH="${PUBLISH_JE_ZIEL[$idx]:-0}" do_one "$t" "$h" "$ej" 2>&1 | zeitstempel > "$ziel"
-        # [Ohne dieses exit waere der Rueckgabewert der des FILTERS --
-        #  jeder Auftrag haette dann Erfolg gemeldet.]
-        exit ${PIPESTATUS[0]} ) &
+    # Abhaengigkeiten dieses Auftrags: bei --run-only alle BAUENDEN
+    # Auftraege desselben Ziels -- egal, an welcher Stelle sie in der
+    # Befehlszeile stehen (auch wenn sie erst NACH diesem kommen).
+    local deps="" didx
+    if (( ${RUN_ONLY_JE_ZIEL[$idx]:-0} )); then
+      for didx in "${!TARGETS[@]}"; do
+        [[ $didx == "$idx" ]] && continue
+        [[ ${TARGETS[$didx]} == "$t" ]] || continue
+        (( ${RUN_ONLY_JE_ZIEL[$didx]:-0} )) && continue
+        deps+="$didx:${TARGETS[$didx]}@${HOSTS[$didx]} "
+      done
     fi
+    # --run-only baut nicht -- er belegt keinen Bauplatz auf dem Host.
+    # [Er laedt nur herunter und startet; neben einem laufenden Bau auf
+    #  derselben Maschine stoert das nicht. Frueher wartete er trotzdem
+    #  auf exe@windows, bloss weil es derselbe Rechner war.]
+    local braucht_platz=1
+    (( ${RUN_ONLY_JE_ZIEL[$idx]:-0} )) && braucht_platz=0
+    local modus=still
+    (( LOG_STDOUT )) && modus=logstdout
+    (( ! LOG_STDOUT && VERBOSE )) && modus=verbose
+    ( xbm_auftrag_warten "$idx" "$h" "$grenze" "$braucht_platz" "$deps" "$sdatei"
+      dep_fehler=$XBM_WARTE_DEP_FEHLER
+      exec 3>&1
+      case $modus in
+        logstdout)
+          # GENAU DER LOGINHALT, auch auf dem Bildschirm.
+          # [Erst stempeln, dann verteilen -- so ist die Bildschirmausgabe
+          #  Zeile fuer Zeile das, was auch in der Datei steht.]
+          XBM_STATUS_DATEI="$sdatei" XBM_DEP_FEHLER="$dep_fehler" XBM_TUE_RUN="${RUN_JE_ZIEL[$idx]:-0}" XBM_TUE_RUN_ONLY="${RUN_ONLY_JE_ZIEL[$idx]:-0}" XBM_TUE_PUBLISH="${PUBLISH_JE_ZIEL[$idx]:-0}" do_one "$t" "$h" "$ej" 2>&1 \
+            | zeitstempel | tee "$ziel" >&3
+          rc=${PIPESTATUS[0]} ;;
+        verbose)
+          # Volle Ausgabe auf BEIDES: Bildschirm ohne, Datei mit Zeitstempel.
+          XBM_STATUS_DATEI="$sdatei" XBM_DEP_FEHLER="$dep_fehler" XBM_TUE_RUN="${RUN_JE_ZIEL[$idx]:-0}" XBM_TUE_RUN_ONLY="${RUN_ONLY_JE_ZIEL[$idx]:-0}" XBM_TUE_PUBLISH="${PUBLISH_JE_ZIEL[$idx]:-0}" do_one "$t" "$h" "$ej" 2>&1 \
+            | tee >(zeitstempel > "$ziel") >&3
+          rc=${PIPESTATUS[0]} ;;
+        *)
+          # Volle Ausgabe nur ins Log; der Bildschirm bekommt ueber
+          # Kennung 3 nur den Fortschritt. Auch was die Unterschale SELBST
+          # meldet, gehoert ins Log (sonst verschiebt es die Statusflaeche).
+          exec 2>>"$ziel"
+          XBM_STATUS_DATEI="$sdatei" XBM_DEP_FEHLER="$dep_fehler" XBM_TUE_RUN="${RUN_JE_ZIEL[$idx]:-0}" XBM_TUE_RUN_ONLY="${RUN_ONLY_JE_ZIEL[$idx]:-0}" XBM_TUE_PUBLISH="${PUBLISH_JE_ZIEL[$idx]:-0}" do_one "$t" "$h" "$ej" 2>&1 | zeitstempel > "$ziel"
+          # [Ohne das Festhalten waere der Rueckgabewert der des FILTERS --
+          #  jeder Auftrag haette dann Erfolg gemeldet.]
+          rc=${PIPESTATUS[0]} ;;
+      esac
+      xbm_auftrag_ende "$idx" "$h" "$rc"
+      exit "$rc" ) &
     pid+=($!); XBM_JOB_PIDS+=($!); name+=("${t}@${h}"); logf+=("$lf")
+    echo "$!" > "$STATUS_DIR/.pid/$idx"
     host_of+=("$h")
     target_of+=("$t")
     runonly_of+=("${RUN_ONLY_JE_ZIEL[$idx]:-0}")

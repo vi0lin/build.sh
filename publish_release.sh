@@ -61,9 +61,24 @@ fi
 #  im Ordner -> Android-Paket; eine .exe -> Windows-Zip; sonst wird eine
 #  einzelne Programmdatei im obersten Ordner erwartet (Linux/Mac-Binary).]
 shopt -s nullglob
-apks=("$quelle"/*.apk)
+# ZWISCHENSTAENDE DES APK-BAUS NICHT MITZAEHLEN. [build_apk.sh legt in
+#  denselben Ordner auch <name>-unaligned.apk und <name>-aligned.apk --
+#  beide UNSIGNIERT. Nach einem Bau, der zwischen Ausrichten und Signieren
+#  abbrach, liegen sie noch da, und alphabetisch kommt "-aligned" VOR dem
+#  fertigen "<name>.apk": veroeffentlicht worden waere ein unsigniertes
+#  Paket, das kein Android installiert.]
+apks=()
+for _a in "$quelle"/*.apk; do
+  case $_a in *-unaligned.apk|*-aligned.apk) continue ;; esac
+  apks+=("$_a")
+done
 exes=("$quelle"/*.exe)
 shopt -u nullglob
+if (( ${#apks[@]} > 1 )); then
+  echo "  Mehrere .apk in $quelle -- nicht eindeutig, welche gemeint ist:" >&2
+  printf '    %s\n' "${apks[@]}" >&2
+  exit 1
+fi
 if (( ${#apks[@]} > 0 )); then
   paketart=apk
 elif (( ${#exes[@]} > 0 )); then
@@ -192,9 +207,8 @@ case $paketart in
       || { echo "  Paket $paket ist leer oder fehlt" >&2; exit 1; }
     ;;
   apk)
-    shopt -s nullglob
-    apks=("$quelle"/*.apk)
-    shopt -u nullglob
+    # Dieselbe, oben bereinigte Liste -- NICHT neu globben (sonst waeren
+    # die unsignierten Zwischenstaende wieder dabei).
     (( ${#apks[@]} > 0 )) || { echo "  keine .apk in $quelle gefunden" >&2; exit 1; }
     paket="xbm-${schluessel}-${version}.apk"
     cp "${apks[0]}" "$arbeitsordner/$paket"
