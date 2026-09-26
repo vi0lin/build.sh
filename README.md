@@ -3,7 +3,7 @@ Bash-Script for building projects on different machines with nice to have featur
 The User Experience And Text Flushing On The Console Is Still Not Good - But It Works.
 
 # Usage
-This Github Repo Delivers A '''config/''' Folder.
+This Github Repo Delivers A ```config/``` Folder.
 Its An Example How To Set Projects Up For Running build.sh
 
 # Features:
@@ -27,9 +27,9 @@ Its An Example How To Set Projects Up For Running build.sh
 This will push the current changes of the project to its git repository.
 Then it builds the project as defined.
 --run-only will in my case pull the .apk and install it over cable to my connected phone. (that function will be renamed)
-'''
+```
 push() {
   git add .; git commit -m "Publishing"; git push
 }
 push; build.sh --publish exe@windows apk@buildserver deb@local --run-only apk@windows
-'''
+```
