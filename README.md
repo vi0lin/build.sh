@@ -5,13 +5,13 @@ The User Experience And Text Flushing On The Console Is Still Not Good - But It 
 # Installation
 ```
 ./build.sh --add-to-path
-# and then in any project directory with a properly setup config/ folder, you can run
+# and then in any project directory with a build.sh.conf in its root, you can run
 build.sh --help
 build.sh --show
 ```
 
 # Usage
-This Github Repo Delivers A ```config/``` Folder.
+This repo ships `build.sh.conf`. It replaces the former `config/` folder (`[hosts]`, `[targets]`, `[release]`, `[packages]`, `[exclude]` sections, each in the format of the former file).
 Its An Example How To Set Projects Up For Running build.sh
 ```
 # builds and pushes it to your releases.git
