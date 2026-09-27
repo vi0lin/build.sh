@@ -4,6 +4,7 @@ The User Experience And Text Flushing On The Console Is Still Not Good - But It 
 
 # Installation
 ```
+git clone https://github.com/vi0lin/build.sh && cd build.sh
 ./build.sh --add-to-path
 # and then in any project directory with a build.sh.conf in its root, you can run
 build.sh --help
