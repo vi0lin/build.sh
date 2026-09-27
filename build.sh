@@ -46,6 +46,13 @@ XBM_BUILD_PROTO=3
 #    Raus; stattdessen je Auftrag eine Logdatei und eine Zusammenfassung.
 # ---------------------------------------------------------------------------
 set -uo pipefail
+# GEERBTE KENNUNG 3 SCHLIESSEN. [build.sh benutzt Kennung 3 selbst -- in
+#  jedem Auftrag als Kanal zum Bildschirm (exec 3>&1). Manche Terminals,
+#  Editoren und Startprogramme hinterlassen aber eine eigene, oft NUR
+#  LESEND geoeffnete Kennung 3. Die erbte build.sh, und jede Ausgabe
+#  dorthin scheiterte mit "Bad file descriptor". Von aussen hat Kennung 3
+#  hier nichts zu suchen.]
+exec 3>&-
 # JOBSTEUERUNG EIN.
 # [Damit legt bash jeden Hintergrundauftrag in eine EIGENE
 #  Prozessgruppe. Nur so laesst er sich mitsamt seinen Kindern beenden,
@@ -439,8 +446,97 @@ if [[ $# -gt 0 && $1 != -* && $1 != *@* ]] && [[ -d $1 ]]; then
   PROJEKT_DIR=$1; shift
 fi
 
+# ---------------------------------------------------------------------------
+# --zustand: MOMENTAUFNAHME EINES LAUFENDEN (ODER HAENGENDEN) LAUFS.
+# [In einem ZWEITEN Terminal aufrufen, waehrend der Lauf haengt. Haelt fest,
+#  was man von aussen sonst nicht sieht: welcher Prozess jedes Auftrags
+#  gerade was tut und in welchem ZUSTAND er ist (S schlaeft/wartet,
+#  R rechnet, D wartet auf die Platte, T vom System ANGEHALTEN), wie lange
+#  jedes Log schon still steht, und wie ausgelastet der Rechner ist.
+#  Schreibt nichts am laufenden Lauf um -- nur lesen.]
+# ---------------------------------------------------------------------------
+xbm_zustand() {
+  local logdir=${XBM_LOGDIR:-builds/logs}
+  local sd="$logdir/.status"
+  local aus; aus="$logdir/zustand-$(date +%Y%m%d-%H%M%S).txt"
+  local jetzt; jetzt=$(date +%s)
+  {
+    echo "=== build.sh --zustand  $(date '+%d.%m.%Y %H:%M:%S')  auf $(hostname 2>/dev/null) ==="
+    echo
+    echo "--- Kopf des Laufs ---"
+    cat "$logdir/letzter-lauf-kopf.log" 2>/dev/null || echo "(keiner)"
+    echo
+    echo "--- Letzte Ereignisse ---"
+    tail -n 25 "$logdir/letzter-lauf.log" 2>/dev/null || echo "(keine)"
+    echo
+    echo "--- Auftraege ---"
+    local f i p alter
+    for f in "$sd"/.pid/*; do
+      [[ -f $f ]] || continue
+      i=${f##*/}; p=$(cat "$f" 2>/dev/null)
+      printf 'Auftrag %s  pid/Gruppe %s  Ergebnis: %s\n' "$i" "$p" \
+        "$(cat "$sd/.rc/$i" 2>/dev/null || echo 'laeuft noch')"
+      printf '  Anzeige: %s\n' "$(cat "$sd/$i" 2>/dev/null)"
+      if [[ -n $p ]]; then
+        echo "  Prozesse dieser Gruppe (STAT: S=wartet R=rechnet D=Platte T=ANGEHALTEN Z=beendet):"
+        ps -eo pgid=,pid=,stat=,etime=,wchan:22=,args= 2>/dev/null \
+          | awk -v g="$p" '$1==g' | cut -c1-200 | sed 's/^/    /'
+      fi
+    done
+    echo "Belegte Bauplaetze: $(ls "$sd/.slots" 2>/dev/null | tr '\n' ' ')"
+    echo
+    echo "--- Logs: letzte Zeile und wie lange still ---"
+    for f in "$logdir"/*@*.log; do
+      [[ -f $f ]] || continue
+      alter=$(( jetzt - $(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "$jetzt") ))
+      printf '%-28s seit %5s s still | %s\n' "${f##*/}" "$alter" \
+        "$(tail -n 1 "$f" 2>/dev/null | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | cut -c1-120)"
+    done
+    echo
+    echo "--- Alle build.sh-, ssh-, ninja-, Compiler-Prozesse ---"
+    ps -eo pid=,ppid=,pgid=,stat=,etime=,args= 2>/dev/null \
+      | awk '$6 ~ /build\.sh|ssh|sshpass|ninja|cmake|cc1|clang|gcc|g\+\+|gradle|java|adb/ || $7 ~ /build\.sh/' \
+      | grep -v -- '--zustand' | cut -c1-200
+    echo
+    echo "--- WER VERBRAUCHT GERADE CPU? (gemessen ueber 3 s) ---"
+    # [ps %cpu ist ein Durchschnitt ueber die GANZE Lebenszeit -- ein
+    #  Prozess, der erst seit Kurzem durchdreht, faellt darin kaum auf.
+    #  Deshalb zwei Momentaufnahmen aus /proc und die Differenz. Ohne
+    #  /proc (FreeBSD) bleibt es beim Lebenszeit-Durchschnitt.]
+    if [[ -r /proc/stat ]]; then
+      local hz; hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+      local -A t1=()
+      local q f
+      for q in /proc/[0-9]*; do
+        read -r -a f < "$q/stat" 2>/dev/null || continue
+        t1[${q#/proc/}]=$(( f[13] + f[14] ))
+      done
+      sleep 3
+      for q in /proc/[0-9]*; do
+        p=${q#/proc/}
+        [[ -n ${t1[$p]+x} ]] || continue
+        read -r -a f < "$q/stat" 2>/dev/null || continue
+        printf '%d %s %s\n' $(( (f[13] + f[14] - t1[$p]) * 100 / hz / 3 )) "$p" \
+          "$(tr '\0\n\r' '   ' < "$q/cmdline" 2>/dev/null | cut -c1-110)"
+      done | sort -rn | head -n 12 | awk '($1 + 0) > 0 {printf "  %4d %%  pid %-7s %s\n", $1, $2, substr($0, index($0,$3))}'
+      echo "  (100 % = ein voller Kern; nichts gelistet = alles im Leerlauf)"
+    else
+      ps -eo pcpu=,pid=,args= 2>/dev/null | sort -rn | head -n 12
+    fi
+    echo
+    echo "--- Rechner ---"
+    uptime 2>/dev/null
+    free -m 2>/dev/null || vmstat 2>/dev/null | tail -n 2
+    df -h . 2>/dev/null | tail -n 1
+  } > "$aus" 2>&1
+  cat "$aus"
+  echo
+  echo ">>> Gespeichert in: $aus  -- diese Datei bitte mitschicken."
+}
+
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --zustand)        xbm_zustand; exit 0 ;;   # siehe xbm_zustand -- NUR lesen
     --clean)          CLEAN=1; shift ;;
     --clean-deep)      CLEANDEEP=1; shift ;;
     -t|--target)
@@ -781,6 +877,8 @@ Beispiele:
   build.sh apk@buildserver
   build.sh -t deb,exe -o local
 
+--zustand           Momentaufnahme eines haengenden Laufs (im zweiten
+                    Terminal aufrufen); Datei unter builds/logs/zustand-*.txt
 config/hosts.conf   name | os | benutzer@host | pfad | passwort
                     os ist "posix" oder "windows"; Passwort leer lassen,
                     wenn ein SSH-Schluessel benutzt wird.
@@ -1101,7 +1199,14 @@ ssh_cmd() {                      # $1 = hostname -> setzt SSH_ARGV
   #  ControlPath nutzt %C (ein kurzer Hash) -- ein langer Pfad sprengt
   #  sonst die Laengengrenze von Unix-Sockets.]
   local cpfad="${TMPDIR:-/tmp}/xbm-%C"
-  SSH_ARGV+=(ssh -o BatchMode=no -o StrictHostKeyChecking=accept-new
+  # OHNE PASSWORT: BatchMode=yes. [Sonst fragt ssh bei fehlendem oder
+  #  abgelehntem Schluessel ueber das TERMINAL nach einem Passwort --
+  #  aus einem Hintergrundauftrag heraus haelt das System ihn dabei an
+  #  (SIGTTIN), und der Bau steht still, statt mit "Permission denied"
+  #  zu scheitern. Mit Passwort braucht sshpass BatchMode=no.]
+  local batch=yes
+  [[ -n $pw ]] && batch=no
+  SSH_ARGV+=(ssh -o BatchMode=$batch -o StrictHostKeyChecking=accept-new
              -o ConnectTimeout=20
              -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
   if (( ! XBM_KEIN_MUX )); then
@@ -3121,12 +3226,41 @@ messpunkt() {                    # messpunkt <text>
 #  wirklich aelter ist; ein normaler inkrementeller Bau bleibt unberuehrt.]
 # ---------------------------------------------------------------------------
 quellen_auffrischen() {          # quellen_auffrischen <bauordner>
+  # NUR QUELLEN ANFASSEN, DEREN INHALT SICH GEAENDERT HAT.
+  # [Vorher: jede Quelle, die aelter war als ihre Objektdatei. Nach einem
+  #  erfolgreichen Bau ist aber JEDE unveraenderte Quelle aelter als ihr
+  #  Objekt -- das ist der Normalfall. Die Funktion fasste also bei jedem
+  #  Lauf alle unveraenderten Dateien an, und ninja uebersetzte alles neu:
+  #  "26 Quelldatei(en) ... aufgefrischt", jeder Bau begann bei [1/n].
+  #  Das eigentliche Ziel -- eine GEAENDERTE Quelle, die nach unzip mit
+  #  altem Zeitstempel ankommt -- erkennt man am INHALT: je Quelle wird
+  #  die Pruefsumme des letzten Laufs gemerkt. cksum gehoert zu POSIX und
+  #  ist auf Linux, FreeBSD und in WSL gleich.]
   local bdir=$1
   [[ -d $bdir ]] || return 0
-  local n=0 q o ts
+  local merk="$bdir/.xbm-quellen.cksum"
+  local neu="$merk.neu"
+  local -A vorher=()
+  local sum len pfad
+  if [[ -f $merk ]]; then
+    while read -r sum len pfad; do
+      [[ -n $pfad ]] && vorher[$pfad]="$sum $len"
+    done < "$merk"
+  fi
+  : > "$neu" 2>/dev/null || return 0
+  local n=0 q o c ts
+  local -A gesehen=()
   while IFS= read -r o; do
     q=${o#*.dir/}; q=${q%.o}; q=${q%.obj}
     [[ -f $q ]] || continue
+    [[ -n ${gesehen[$q]+x} ]] && continue
+    gesehen[$q]=1
+    c=$(cksum < "$q" 2>/dev/null) || continue
+    printf '%s %s\n' "$c" "$q" >> "$neu"
+    # Unbekannt (erster Lauf) oder unveraendert: nichts tun.
+    [[ -n ${vorher[$q]+x} ]] || continue
+    [[ ${vorher[$q]} == "$c" ]] && continue
+    # Inhalt geaendert -- sieht ninja das ohnehin (Quelle neuer)?
     [[ $q -nt $o ]] && continue
     touch "$q" 2>/dev/null
     if [[ ! $q -nt $o ]]; then
@@ -3136,10 +3270,11 @@ quellen_auffrischen() {          # quellen_auffrischen <bauordner>
     fi
     [[ $q -nt $o ]] && n=$((n+1))
   done < <(find "$bdir" \( -name '*.o' -o -name '*.obj' \) 2>/dev/null)
+  mv -f "$neu" "$merk" 2>/dev/null
   if (( n > 0 )); then
-    log "  $n Quelldatei(en) waren aelter als ihre Objektdatei -- aufgefrischt"
-    log "  (sonst uebersprungen ninja sie und band alte Objekte)"
+    log "  $n geaenderte Quelldatei(en) hatten einen alten Zeitstempel -- aufgefrischt"
   fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3219,8 +3354,11 @@ zeitstempel() {
   if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) ))
   then
     local z
+    # %.T (Mikrosekunden) kennt nur ts, nicht Bashs printf -- es landete
+    # woertlich als "{%.T}" im Log. Ohne ts also sekundengenau.
+    local fmt=${XBM_TS_FORMAT//%.T/%T}
     while IFS= read -r z; do
-      printf "%($XBM_TS_FORMAT)T %s\n" -1 "$z"
+      printf "%($fmt)T %s\n" -1 "$z"
     done
     return
   fi
@@ -3328,8 +3466,13 @@ fortschritt() {                  # nur auf den Bildschirm
     return 0
   fi
 
-  if { true >&3; } 2>/dev/null; then printf '%s' "$*" >&3
-  else printf '%s' "$*"; fi
+  # DER SCHREIBVERSUCH SELBST IST DIE PRUEFUNG.
+  # [Vorher: "{ true >&3; }" als Test, dann schreiben. Ist Kennung 3 aber
+  #  von aussen NUR LESEND geerbt, gelingt der Test (true schreibt ja
+  #  nichts), erst das echte printf scheitert: "printf: write error: Bad
+  #  file descriptor" -- und die Zeile ging verloren. Jetzt wird einmal
+  #  geschrieben; scheitert das, gehts auf die Standardausgabe.]
+  { printf '%s' "$*" >&3; } 2>/dev/null || printf '%s' "$*"
 }
 
 # ---------------------------------------------------------------------------
@@ -3366,38 +3509,59 @@ zeichner_start() {                # zeichner_start <name...>
   CURSOR_VERSTECKT=1
   for ((i=0; i<n; i++)); do printf '\n'; done
   (
+    # OHNE NEUE PROZESSE JE BILD. [Vorher entstanden alle 0,1 s mehrere
+    #  Prozesse: tput (COLUMNS ist in dieser Unterschale nie gesetzt), je
+    #  Zeile eine $(printf ...)-Unterschale, dazu sleep -- und es wurde auch
+    #  dann neu gezeichnet, wenn sich nichts geaendert hatte. Jetzt: Text
+    #  direkt zusammensetzen, Breite nur alle ~5 s neu ermitteln (SIGWINCH
+    #  erreicht diesen Hintergrundprozess nicht), nur bei Aenderung zeichnen,
+    #  und warten mit dem eingebauten read -t statt mit dem Programm sleep.]
+    local breite=80 takt=0 alt=$'\x01' inhalt z kopf
+    # In { } geklammert: ein nacktes "exec ... 2>/dev/null" leitet stderr
+    # der GANZEN Unterschale dauerhaft um, nicht nur fuer diesen Befehl.
+    { exec {xbm_schlaf}<> <(:); } 2>/dev/null || xbm_schlaf=""
     while [[ ! -f "$STATUS_DIR/.stop" ]]; do
+      # SELBST BEENDEN, WENN NIEMAND MEHR ZUSIEHT. [$$ ist in dieser
+      #  Unterschale die Kennung des HAUPTskripts. Ist es weg (Absturz,
+      #  kill -9, geschlossenes Fenster) oder das Terminal verschwunden,
+      #  gibt es nichts mehr zu zeichnen -- vorher lief die Schleife dann
+      #  als Waise endlos weiter.]
+      kill -0 "$$" 2>/dev/null || break
+      [[ -t 1 ]] || break
       # BREITE DES TERMINALS BEACHTEN.
-      # [Eine zu lange Zeile bricht um und belegt ZWEI Zeilen. Der
-      #  Zeichner faehrt aber nur um n hoch -- ab da stimmt die Rechnung
-      #  nicht mehr, der Block wandert, und stehengebliebene Reste
-      #  bleiben fuer immer stehen. Genau so sieht dein "bleibt stehen"
-      #  aus.]
-      local breite=${COLUMNS:-0}
-      if (( breite <= 0 )); then
+      # [Eine zu lange Zeile bricht um und belegt ZWEI Zeilen. Der Zeichner
+      #  faehrt aber nur um n hoch -- ab da stimmt die Rechnung nicht mehr,
+      #  der Block wandert, und Reste bleiben fuer immer stehen.]
+      if (( takt % 25 == 0 )); then
         breite=$(tput cols 2>/dev/null || echo 80)
+        (( breite < 20 )) && breite=80
       fi
-      (( breite < 20 )) && breite=80
-
-      # ALLES IN EINEM STUECK SCHREIBEN.
-      # [Vorher waren es n+1 einzelne printf-Aufrufe. Schreibt in der
-      #  Zwischenzeit etwas anderes aufs Terminal, landet es MITTEN im
-      #  Block und schiebt ihn auseinander. Ein einziger Schreibvorgang
-      #  kann nicht unterbrochen werden.]
-      local block; block=$(printf '\033[%dA' "$n")
+      takt=$((takt + 1))
+      inhalt=""
       for ((i=0; i<n; i++)); do
-        local z=""
+        z=""
         [[ -f "$STATUS_DIR/$i" ]] && IFS= read -r z < "$STATUS_DIR/$i" 2>/dev/null
         [[ -z $z ]] && z="  ${namen[$i]}"
-        z=${z:0:$((breite-1))}
-        block+=$(printf '\033[2K%s' "$z")
-        block+=$'\n'
+        inhalt+=$'\033[2K'"${z:0:$((breite-1))}"$'\n'
       done
-      printf '%s' "$block"
-      sleep 0.1
+      # ALLES IN EINEM STUECK SCHREIBEN -- und nur, wenn sich etwas
+      # geaendert hat. [Ein einziger Schreibvorgang kann nicht von anderer
+      #  Terminalausgabe unterbrochen werden, die sonst MITTEN im Block
+      #  landet und ihn auseinanderschiebt.]
+      if [[ $inhalt != "$alt" ]]; then
+        printf -v kopf '\033[%dA' "$n"
+        printf '%s' "$kopf$inhalt"
+        alt=$inhalt
+      fi
+      if [[ -n $xbm_schlaf ]]; then
+        read -r -t 0.2 -u "$xbm_schlaf" _ 2>/dev/null || :
+      else
+        sleep 0.2
+      fi
     done
   ) &
   ZEICHNER_PID=$!
+  [[ -n ${STATUS_DIR:-} ]] && echo "$ZEICHNER_PID" > "$STATUS_DIR/.zeichner" 2>/dev/null
 }
 
 zeichner_stop() {
@@ -3431,6 +3595,77 @@ zeichner_stop() {
 # [ninja meldet "[12/345] ...", cmake und make melden "[ 42%]". Beides
 #  wird erkannt; findet sich nichts, laeuft nur ein Lebenszeichen mit.]
 bau_fortschritt() {              # bau_fortschritt <beschriftung>
+  # SCHNELLER WEG ZUERST. [Die Bash-Schleife unten kostete gemessen rund
+  #  50 Mikrosekunden CPU pro Ausgabezeile: Bash liest aus einer Pipe
+  #  BYTE FUER BYTE (ein Systemaufruf je Zeichen) und prueft danach jede
+  #  Zeile mit einem regulaeren Ausdruck. Bei ausfuehrlichen Bauten sind
+  #  das Sekunden reiner Verwaltungsarbeit, neben dem Compiler.]
+  #
+  # 1) NICHTS ANZUZEIGEN -> nur durchreichen. [Auf dem Bauhost (AS_HOST)
+  #    und mit --verbose/--log-stdout gibt fortschritt() ohnehin nichts
+  #    aus. Die Schleife lief dort trotzdem ueber jede Zeile -- bei
+  #    entfernten Auftraegen also ZWEIMAL: auf dem Bauhost und hier.]
+  if [[ -n ${AS_HOST:-} ]] || (( VERBOSE )) || (( LOG_STDOUT )); then
+    cat
+    return 0
+  fi
+  # 2) NORMALFALL (paralleler Lauf mit Statusdatei) -> EIN awk-Prozess.
+  #    [awk liest blockweise. Nur POSIX-Mittel: der Bauhost hat mal mawk,
+  #     mal das BSD-awk. Die Uhr fuer die Drosselung liefert srand(): es
+  #     gibt den VORIGEN Startwert zurueck, und der ist die aktuelle Zeit
+  #     in Sekunden -- POSIX-awk hat sonst keine Uhr.]
+  if [[ -n ${XBM_STATUS_DATEI:-} ]]; then
+    # mawk HAELT ZEILEN ZURUECK, bis sein Eingabepuffer voll ist -- im
+    # Test kamen drei im Sekundentakt erzeugte Zeilen erst am Ende an.
+    # Die Zeitstempel im Log (werden DANACH gesetzt) waeren falsch, der
+    # Fortschritt spraenge. "-W interactive" liest zeilenweise; andere
+    # awks kennen die Option nicht -- also nur fuer mawk, einmal ermittelt.
+    if [[ -z ${XBM_AWK_OPT+x} ]]; then
+      XBM_AWK_OPT=""
+      # </dev/null ist Pflicht: das BSD-awk (FreeBSD) kennt -W nicht,
+      # haelt "version" fuer ein Programm und LIEST DIE EINGABE -- ohne
+      # Umlenkung frass die Erkennung die ganze Bauausgabe.
+      awk -W version </dev/null 2>/dev/null | grep -qi mawk && XBM_AWK_OPT="-W interactive"
+    fi
+    # shellcheck disable=SC2086   # XBM_AWK_OPT ist absichtlich ungequotet
+    awk $XBM_AWK_OPT -v label="$1" -v ziel="$XBM_STATUS_DATEI" '
+      function jetzt() { srand(); return srand() }
+      function melde(t,   tmp) {
+        if (t == letzt) return
+        letzt = t
+        tmp = ziel ".neu"
+        printf "%s\n", t > tmp
+        close(tmp)
+        system("mv -f \"" tmp "\" \"" ziel "\" 2>/dev/null")
+      }
+      BEGIN { zeilen = 0; sek = -1; proz_alt = -1 }
+      {
+        print; fflush()                       # unveraendert und SOFORT ins Log
+        if (substr($0, 1, 1) != "[" && index($0, "%") == 0) {
+          zeilen++
+          s = jetzt()
+          if (s != sek) { sek = s; melde(sprintf("  %-28s %d Zeilen", label, zeilen)) }
+          next
+        }
+        if (match($0, /^\[[0-9]+\/[0-9]+\]/)) {
+          split(substr($0, 2, RLENGTH - 2), nm, "/")
+          n = nm[1] + 0; m = nm[2] + 0
+          p = (m > 0) ? int(n * 100 / m) : 0
+          if (p != proz_alt || n == m) {
+            proz_alt = p
+            melde(sprintf("  %-28s %3d%%  [%d/%d]", label, p, n, m))
+          }
+        } else if (match($0, /\[ *[0-9]+%\]/)) {
+          t = substr($0, RSTART + 1, RLENGTH - 3); gsub(/ /, "", t)
+          if (t + 0 != proz_alt) {
+            proz_alt = t + 0
+            melde(sprintf("  %-28s %3d%%", label, proz_alt))
+          }
+        }
+      }'
+    return 0
+  fi
+  # 3) SELTENER FALL: interaktiv ohne Statusdatei -- bisherige Schleife.
   local label=$1 zeile n m proz zaehler=0
   # NACH ZEIT AKTUALISIEREN, NICHT NACH ZEILENZAHL.
   # [Vorher: alle 400 Zeilen ein Lebenszeichen. Ein Konfigurationslauf
@@ -3770,7 +4005,7 @@ fern_abbrechen() {               # fern_abbrechen -- auf allen benutzten Hosts
 }
 
 aufraeumen() {                   # Handler fuer Strg-C und TERM
-  trap '' INT TERM              # ein zweites Strg-C soll nicht stoeren
+  trap '' INT TERM HUP          # ein zweites Strg-C soll nicht stoeren
   cursor_zurueck
   printf '\n' >&2
   err "Abbruch -- beende laufende Auftraege..."
@@ -3813,10 +4048,14 @@ aufraeumen() {                   # Handler fuer Strg-C und TERM
     kill -KILL -- "-$pp" 2>/dev/null || kill -KILL -- "$pp" 2>/dev/null || true
   done
   err "beendet."
-  trap - INT TERM
+  trap - INT TERM HUP
   exit 130
 }
-trap aufraeumen INT TERM
+# AUCH HUP: so meldet sich ein geschlossenes Terminalfenster. [Ohne das
+#  starb nur das Hauptskript; die Auftraege laufen wegen "set -m" in
+#  eigenen Prozessgruppen, die ein schliessendes Terminal NICHT erreicht.
+#  Im Test lebten nach dem Schliessen zehn Prozesse weiter -- als Waisen.]
+trap aufraeumen INT TERM HUP
 
 # ---------------------------------------------------------------------------
 # Ein Auftrag
@@ -5204,6 +5443,51 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
 # Setzt XBM_WARTE_DEP_FEHLER (Name eines gescheiterten Vorgaengers oder
 # leer) und XBM_WARTE_SLOT (belegter Bauplatz, von xbm_auftrag_ende
 # wieder freigegeben). Laeuft IM Hintergrundprozess des Auftrags.
+# ---------------------------------------------------------------------------
+# WAISEN FRUEHERER LAEUFE BESEITIGEN.
+# [Ein abgebrochener Lauf (geschlossenes Terminal, kill -9, Absturz)
+#  hinterliess Auftraege und den Zeichner als Waisen. Beim naechsten
+#  Start stehen ihre Kennungen noch in .status/ -- ueber sie, NICHT ueber
+#  eine Textsuche, werden sie gefunden. Angefasst wird nur, was wirklich
+#  ein build.sh ist, und nur, wenn der Lauf, zu dem es gehoerte, beendet
+#  ist: laeuft das damalige Hauptskript noch, bleibt alles unberuehrt.]
+# ---------------------------------------------------------------------------
+xbm_ist_buildsh() {              # xbm_ist_buildsh <pid>
+  local c=""
+  if [[ -r /proc/$1/cmdline ]]; then
+    c=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)
+  else
+    c=$(ps -o args= -p "$1" 2>/dev/null)
+  fi
+  [[ $c == *build.sh* ]]
+}
+
+xbm_waisen_beseitigen() {        # xbm_waisen_beseitigen <status-ordner>
+  local sd=$1 alt g n=0
+  [[ -d $sd ]] || return 0
+  alt=$(cat "$sd/.haupt" 2>/dev/null)
+  if [[ -n $alt && $alt != "$$" ]] && xbm_ist_buildsh "$alt"; then
+    return 0    # der damalige Lauf lebt noch -- nicht anfassen
+  fi
+  local -a gruppen=()
+  for g in $(cat "$sd"/.pid/* "$sd/.zeichner" 2>/dev/null); do
+    [[ $g =~ ^[0-9]+$ ]] || continue
+    [[ $g == "$$" ]] && continue
+    xbm_ist_buildsh "$g" || continue
+    gruppen+=("$g")
+  done
+  (( ${#gruppen[@]} )) || return 0
+  for g in "${gruppen[@]}"; do
+    kill -TERM -- "-$g" 2>/dev/null || kill -TERM "$g" 2>/dev/null; n=$((n+1))
+  done
+  sleep 0.3
+  for g in "${gruppen[@]}"; do
+    kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null
+  done
+  warn "  $n liegengebliebene Prozess(gruppe)n eines abgebrochenen frueheren Laufs beendet"
+  return 0
+}
+
 xbm_auftrag_warten() {
   local idx=$1 h=$2 grenze=$3 braucht_platz=$4 deps=$5 sdatei=$6
   local ich="${TARGETS[$idx]}@${HOSTS[$idx]}"
@@ -5230,6 +5514,7 @@ xbm_auftrag_warten() {
     done
     [[ -z $offen ]] && break
     printf '%s  wartet auf %s\n' "$ich" "$offen" > "$sdatei"
+    kill -0 "$$" 2>/dev/null || exit 1   # Hauptskript weg -> nicht ewig warten
     sleep 1
   done
   for d in $deps; do
@@ -5252,6 +5537,7 @@ xbm_auftrag_warten() {
         fi
       done
       printf '%s  wartet auf freien Platz auf %s\n' "$ich" "$h" > "$sdatei"
+      kill -0 "$$" 2>/dev/null || exit 1   # Hauptskript weg -> nicht ewig warten
       sleep 1
     done
   fi
@@ -5307,7 +5593,9 @@ run_all() {
   LOGDIR=${XBM_LOGDIR:-builds/logs}
   mkdir -p "$LOGDIR"
   STATUS_DIR="$LOGDIR/.status"
+  xbm_waisen_beseitigen "$STATUS_DIR"
   rm -rf "$STATUS_DIR"; mkdir -p "$STATUS_DIR"
+  echo "$$" > "$STATUS_DIR/.haupt"     # fuer xbm_waisen_beseitigen des NAECHSTEN Laufs
   # .rc/<idx>   Rueckgabewert eines fertigen Auftrags (fuer Abhaengige)
   # .pid/<idx>  Prozesskennung (erkennt einen Auftrag, der ohne .rc starb)
   # .slots/     Bauplaetze je Host (siehe xbm_auftrag_warten)
@@ -5374,12 +5662,26 @@ run_all() {
     # [Er laedt nur herunter und startet; neben einem laufenden Bau auf
     #  derselben Maschine stoert das nicht. Frueher wartete er trotzdem
     #  auf exe@windows, bloss weil es derselbe Rechner war.]
+    # AUCH --run-only BELEGT EINEN PLATZ AUF SEINEM HOST.
+    # [Er baut zwar nicht, synchronisiert aber den Projektordner (git
+    #  reset, Werkzeug entpacken) -- auf windows waere das MITTEN in den
+    #  laufenden exe-Bau im selben Ordner gefallen. Das Warten darauf haelt
+    #  nichts mehr an: es passiert im Auftrag selbst, nicht in der
+    #  Startschleife.]
     local braucht_platz=1
-    (( ${RUN_ONLY_JE_ZIEL[$idx]:-0} )) && braucht_platz=0
     local modus=still
     (( LOG_STDOUT )) && modus=logstdout
     (( ! LOG_STDOUT && VERBOSE )) && modus=verbose
-    ( xbm_auftrag_warten "$idx" "$h" "$grenze" "$braucht_platz" "$deps" "$sdatei"
+    ( # EINGABE ABKOPPELN -- ALS ALLERERSTES.
+      # [build.sh laeuft mit "set -m": jeder Auftrag ist eine eigene
+      #  Prozessgruppe im Hintergrund. Liest darin irgendetwas vom
+      #  Terminal (ssh reicht die Eingabe an den Bauhost weiter), haelt das
+      #  System den ganzen Auftrag an (SIGTTIN) -- sobald dort eine Taste
+      #  ankommt. Genau so blieben alle Bauten im selben Moment stehen, egal
+      #  wie weit sie waren. Kein Auftrag braucht die Tastatur: Passwoerter
+      #  laufen ueber sshpass, Daten ueber ausdrueckliche Pipes.]
+      exec </dev/null
+      xbm_auftrag_warten "$idx" "$h" "$grenze" "$braucht_platz" "$deps" "$sdatei"
       dep_fehler=$XBM_WARTE_DEP_FEHLER
       exec 3>&1
       case $modus in

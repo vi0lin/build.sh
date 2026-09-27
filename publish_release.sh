@@ -246,6 +246,24 @@ eintragen() {
 # DIESES Ziel aktualisieren, als den einen Commit festhalten.
 # [Als Funktion, weil es bei einem Push-Wettlauf auf dem
 #  frisch geholten Stand WIEDERHOLT werden muss -- siehe unten.]
+# AELTERE PAKETE DIESES ZIELS ENTFERNEN -- nur eines je Ziel behalten.
+# [Bisher blieb JEDES jemals veroeffentlichte Paket im Repository liegen:
+#  nach fuenf Veroeffentlichungen war ein frischer Klon fuenfmal so gross.
+#  Geklont wird es von jeder Veroeffentlichung auf jedem Bauhost und von
+#  jedem --run-only -- und der Rechner mit dem Git-Server muss dafuer
+#  jedes Mal ALLES packen. Bei flachen Klonen (--depth 1) rechnet Git die
+#  Kompression dabei neu: gemessen 362 % + 173 % CPU auf dem Laptop.
+#  release.json zeigt ohnehin nur auf das jeweils neueste Paket; aeltere
+#  sind fuer die App unerreichbar. Nur Pakete DIESES Ziels ("xbm-<ziel>-")
+#  werden angefasst, die anderer Ziele bleiben.]
+for _alt in xbm-"${schluessel}"-*; do
+  [[ -e $_alt ]] || continue
+  [[ $_alt == "$paket" || $_alt == "$paket.sha256" ]] && continue
+  # Nur "xbm-<ziel>-<ZAHL>.": sonst traefe "deb" auch "xbm-deb-asan-...".
+  _rest=${_alt#xbm-"$schluessel"-}
+  [[ $_rest =~ ^[0-9]+\. ]] || continue
+  git rm -q -f -- "$_alt" 2>/dev/null || rm -f -- "$_alt"
+done
 cp "$arbeitsordner/$paket" ./
 echo "$pruefsumme  $paket" > "${paket}.sha256"
 
