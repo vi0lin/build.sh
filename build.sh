@@ -554,7 +554,7 @@ while [[ $# -gt 0 ]]; do
     --configure-only) CONFIGURE_ONLY=1; shift ;;
     --build-only)     BUILD_ONLY=1; shift ;;
     --run)
-      # NACH ERFOLGREICHEM BAU RUN_CMD[ziel] AUSFUEHREN (config/targets.conf).
+      # NACH ERFOLGREICHEM BAU RUN_CMD[ziel] AUSFUEHREN (build.sh.conf [targets]).
       # POSITIONAL, wie --parallel: gilt fuer alle AB HIER folgenden
       # Ziele, bis --no-run/--no-run-only es wieder abschaltet oder ein
       # weiteres --run/--run-only es aendert. [Gedacht z.B. fuer
@@ -806,7 +806,7 @@ Aufruf:
                  nacheinander; ab hier fuer neu hinzugefuegte Ziele)
 --run           (POSITIONAL wie --parallel: RUN_CMD[ziel] nach
                  erfolgreichem Bau starten, ab hier fuer neu hinzugefuegte
-                 Ziele -- siehe config/targets.conf)
+                 Ziele -- siehe build.sh.conf [targets])
 --run-only      (POSITIONAL: NICHT bauen -- nur das veroeffentlichte
                  Release von releases.git herunterladen und RUN_CMD
                  ausfuehren, ab hier fuer neu hinzugefuegte Ziele)
@@ -814,7 +814,7 @@ Aufruf:
                  hinzugefuegte Ziele)
 --publish       (POSITIONAL: PUBLISH_CMD[ziel] nach erfolgreichem Bau
                  ausfuehren, ab hier fuer neu hinzugefuegte Ziele --
-                 SEPARAT von --run, siehe config/targets.conf)
+                 SEPARAT von --run, siehe build.sh.conf [targets])
 --no-publish    (== kein --publish -- ab hier fuer neu hinzugefuegte
                  Ziele)
 --move-to       (build.sh --move-to <host> <datei> -- ueberträgt eine
@@ -879,12 +879,12 @@ Beispiele:
 
 --zustand           Momentaufnahme eines haengenden Laufs (im zweiten
                     Terminal aufrufen); Datei unter builds/logs/zustand-*.txt
-config/hosts.conf   name | os | benutzer@host | pfad | passwort
+build.sh.conf [hosts]   name | os | benutzer@host | pfad | passwort
                     os ist "posix" oder "windows"; Passwort leer lassen,
                     wenn ein SSH-Schluessel benutzt wird.
-config/targets.conf declare -A CONF_CMD BUILD_CMD RUN_CMD PUBLISH_CMD DOWNLOAD
+build.sh.conf [targets] declare -A CONF_CMD BUILD_CMD RUN_CMD PUBLISH_CMD DOWNLOAD
                     Release-Name = Name des Bauordners (builds/deb -> "deb").
-                    Vorlage: config/ im Repository von build.sh.
+                    Vorlage: build.sh.conf.beispiel im Repository von build.sh.
 EOF
       exit 0 ;;
     -*) err "unbekannte Option: $1"; exit 2 ;;
@@ -988,18 +988,68 @@ XBM_HOSTS_GLOBAL=()
 [[ -n ${XBM_HOSTS:-} ]] && XBM_HOSTS_GLOBAL+=("$XBM_HOSTS")
 XBM_HOSTS_GLOBAL+=("$HOME/.config/xbm/hosts.conf" "/etc/xbm/hosts.conf")
 
+# ---------------------------------------------------------------------------
+# EINE KONFIGURATIONSDATEI: build.sh.conf IM PROJEKTSTAMM.
+#
+# Sie ersetzt den Ordner config/ mit seinen fuenf Dateien. Jeder Abschnitt
+# behaelt das Format der frueheren Datei -- bestehende Inhalte lassen sich
+# also Zeile fuer Zeile uebernehmen:
+#
+#     [hosts]      wie hosts.conf     name | os | benutzer@host | pfad | passwort | git | ...
+#     [targets]    wie targets.conf   CONF_CMD[deb]='...'   (Bash)
+#     [release]    wie release.conf   RELEASE_GIT_URL="..." (Bash)
+#     [packages]   wie packages.conf  apt::zip = zip
+#     [exclude]    wie exclude.conf   external/
+#
+# Zeilen vor dem ersten Abschnitt und Kommentare (#) werden ueberlesen.
+# Abschnittsnamen sind gross/klein egal. Ein fehlender Abschnitt zaehlt
+# wie eine fehlende Datei frueher.
+#
+# UMSETZUNG: beim Start werden die Abschnitte einmal in einen
+# Temporaerordner zerlegt, und XBM_KONFDIR zeigt dorthin. Die bewaehrten
+# Leseroutinen (Host-Tabelle, Bash-Quellen, awk fuer exclude) bleiben
+# unveraendert -- sie bekommen nur einen anderen Ordner. Gibt es KEINE
+# build.sh.conf, gilt weiter config/ (alte Projekte laufen unveraendert).
+# Eine andere Datei: XBM_KONF_DATEI=/pfad/zur/datei build.sh ...
+# ---------------------------------------------------------------------------
+XBM_KONF_DATEI=${XBM_KONF_DATEI:-build.sh.conf}
+XBM_KONFDIR=config
+konfig_laden() {
+  [[ -f $XBM_KONF_DATEI ]] || return 0
+  XBM_KONFDIR=$(mktemp -d "${TMPDIR:-/tmp}/xbm-konf.XXXXXX") || {
+    err "konnte keinen Temporaerordner fuer $XBM_KONF_DATEI anlegen"; exit 1; }
+  # [awk statt Bash-Schleife: BSD-awk auf FreeBSD und mawk lesen beide
+  #  so; "print > datei" haelt die Abschnittsdatei offen, bis sie sich
+  #  aendert. CR am Zeilenende (Datei mal unter Windows bearbeitet) wird
+  #  entfernt, sonst stuende es im Hostnamen.]
+  awk -v dir="$XBM_KONFDIR" '
+    { sub(/\r$/, "") }
+    /^[[:space:]]*\[[A-Za-z_-]+\][[:space:]]*$/ {
+      s = $0; gsub(/[][ \t]/, "", s); datei = dir "/" tolower(s) ".conf"; next
+    }
+    datei != "" { print > datei }
+  ' "$XBM_KONF_DATEI"
+}
+konfig_aufraeumen() {
+  [[ -n ${XBM_KONFDIR:-} && $XBM_KONFDIR == */xbm-konf.* ]] && rm -rf "$XBM_KONFDIR"
+  return 0
+}
+konfig_laden
+trap konfig_aufraeumen EXIT
+
 # Bei --exec braucht es keine Bau-Ziele.
 if (( ! EXEC_MODE )) && (( ! LIST_MODE )); then
-  [[ -f config/targets.conf ]] || { err "config/targets.conf fehlt"; exit 1; }
+  [[ -f "$XBM_KONFDIR/targets.conf" ]] || {
+    err "keine Ziele: kein Abschnitt [targets] in $XBM_KONF_DATEI -- und auch kein config/targets.conf"; exit 1; }
 fi
-[[ -f config/targets.conf ]] || : 
+[[ -f "$XBM_KONFDIR/targets.conf" ]] || : 
 # shellcheck disable=SC1091
 # IMMER DEKLARIEREN, auch ohne targets.conf.
 # [Ohne die Deklaration bricht  ${#CONF_CMD[@]}  unter  set -u  mit
 #  "unbound variable" ab -- und bei --exec und --list gibt es die Datei
 #  ja voellig zu Recht nicht.]
 declare -A CONF_CMD BUILD_CMD RUN_CMD PUBLISH_CMD REQUIRE DOWNLOAD RELEASE_NAME
-[[ -f config/targets.conf ]] && source config/targets.conf
+[[ -f "$XBM_KONFDIR/targets.conf" ]] && source "$XBM_KONFDIR/targets.conf"
 
 declare -A HOST_OS HOST_SSH HOST_PATH HOST_PASS HOST_XFER HOST_GIT
 HOST_SSH=() HOST_OS=() HOST_PATH=() HOST_PASS=() HOST_XFER=()
@@ -1151,7 +1201,7 @@ hosts_einlesen() {               # hosts_einlesen <datei>
       continue
     fi
     if [[ -z $local_path ]]; then
-      err "config/hosts.conf: Host '$local_name' ohne Pfad"
+      err "build.sh.conf [hosts]: Host '$local_name' ohne Pfad"
       err "  benutzer@host = '${local_ssh}'"
       err "  Erwartet:  name | os | benutzer@host | pfad | passwort"
       err "  (Fuer einen oertlichen Host benutzer@host leer lassen.)"
@@ -1168,7 +1218,7 @@ hosts_einlesen() {               # hosts_einlesen <datei>
 for _hf in "${XBM_HOSTS_GLOBAL[@]}"; do
   [[ -f $_hf ]] && { hosts_einlesen "$_hf"; HOST_QUELLE_GLOBAL="$_hf"; }
 done
-hosts_einlesen "config/hosts.conf"
+hosts_einlesen "$XBM_KONFDIR/hosts.conf"
 
 # ---------------------------------------------------------------------------
 # SSH-Aufruf als ARRAY zusammensetzen -- nie als Zeichenkette.
@@ -1793,7 +1843,7 @@ remote_has() {                   # gibt es das Programm auf dem Ziel?
 #
 # Dazu kommen Muster fuer Erzeugnisse, die auch ausserhalb solcher Ordner
 # liegen koennen (*.o neben der Quelle etwa), und eine eigene Liste in
-# config/exclude.conf -- eine Zeile je Muster, # fuer Kommentare.
+# build.sh.conf [exclude] -- eine Zeile je Muster, # fuer Kommentare.
 # ---------------------------------------------------------------------------
 XFER_MUSTER=(
   '*.o' '*.a' '*.so' '*.so.*' '*.dll' '*.dylib' '*.exe' '*.obj' '*.lib'
@@ -1863,7 +1913,7 @@ xfer_find() {                    # xfer_find [<marke fuer -newer>]
     (( erste )) || args+=(-o); erste=0
     args+=(-path "./$d")
   done < <(xfer_bauordner)
-  # config/exclude.conf wird NACHTRAEGLICH angewandt (xfer_filter) --
+  # build.sh.conf [exclude] wird NACHTRAEGLICH angewandt (xfer_filter) --
   # nicht hier. [Nur so lassen sich AUSNAHMEN ausdruecken: "alles unter
   #  external/, aber pdf und miniaudio behalten". In einem find-Ausdruck
   #  waere das kaum lesbar; als Nachfilter sind es drei Zeilen.]
@@ -1878,7 +1928,7 @@ xfer_find() {                    # xfer_find [<marke fuer -newer>]
   { find "${args[@]}" 2>/dev/null; xfer_ausnahmen; } | xfer_filter
 }
 
-# Wendet config/exclude.conf an. Regeln in der Reihenfolge der Datei,
+# Wendet build.sh.conf [exclude] an. Regeln in der Reihenfolge der Datei,
 # die LETZTE passende gewinnt -- damit kann eine Ausnahme eine vorherige
 # Ausschlussregel aufheben.
 #
@@ -1937,7 +1987,7 @@ xfer_roh() {                     # xfer_roh <startordner>
 #  mehr geschrieben.]
 # ---------------------------------------------------------------------------
 xfer_filter() {
-  [[ -f config/exclude.conf ]] || { cat; return; }
+  [[ -f "$XBM_KONFDIR/exclude.conf" ]] || { cat; return; }
   awk '
     # --- Glob in einen regulaeren Ausdruck wandeln ---
     function esc(c) {
@@ -1995,14 +2045,14 @@ xfer_filter() {
         if ($0 ~ re[i]) behalten = neg[i] ? 1 : 0
       if (behalten) print
     }
-  ' config/exclude.conf -
+  ' "$XBM_KONFDIR/exclude.conf" -
 }
 
 # Liefert die Ordner, die durch eine !-Regel wieder hereingeholt werden
 # sollen. [Sie muessen zusaetzlich durchsucht werden: in einen
 #  ausgeschlossenen Ordner sieht xfer_find gar nicht erst hinein.]
 xfer_ausnahmen() {
-  [[ -f config/exclude.conf ]] || return 0
+  [[ -f "$XBM_KONFDIR/exclude.conf" ]] || return 0
   local z m t
   while IFS= read -r z || [[ -n ${z:-} ]]; do
     z=$(trim "${z:-}")
@@ -2017,7 +2067,7 @@ xfer_ausnahmen() {
         [[ -d $t ]] && xfer_roh "./${t#./}"
       done
     fi
-  done < config/exclude.conf
+  done < "$XBM_KONFDIR/exclude.conf"
 }
 
 EXCLUDES=(--exclude '.git/' --exclude 'builds/' --exclude 'build-*/'
@@ -2055,7 +2105,7 @@ push_project() {
     # URL in hosts.conf noch --git auf der Befehlszeile. Ein stiller
     # Rueckfall auf ssh waere hier das Gegenteil von "erzwungen".
     err "  --force-git gesetzt, aber '$h' hat keine Git-URL"
-    err "  (weder in config/hosts.conf Feld 7 noch per --git <url>)."
+    err "  (weder in build.sh.conf [hosts] Feld 7 noch per --git <url>)."
     return 1
   fi
   if [[ -n $git_url ]]; then
@@ -2375,7 +2425,7 @@ push_project() {
           err "  Windows kann eine LAUFENDE Datei nicht ersetzen:"
           grep "Could not unlink" "$xferlog" | head -3 | sed 's/^/      /' >&2
           err "  Entweder die App drueben schliessen -- oder die Ausnahme in"
-          err "  config/exclude.conf auf Ergebnisse beschraenken, die die"
+          err "  build.sh.conf [exclude] auf Ergebnisse beschraenken, die die"
           err "  Gegenseite NICHT selbst baut (apk, deb -- nicht die exe)."
         fi
         rm -f "$xferlog"
@@ -2407,7 +2457,7 @@ push_project() {
 # Was soll nach dem Bau zurueckgeholt werden?
 # [Bisher wurde der GANZE Ordner builds/<ziel> geholt. Bei apk sind das
 #  Zwischenstaende, Objektdateien und ein paar hundert MB -- gebraucht
-#  wird eine Datei. Deshalb je Ziel eine Liste in config/targets.conf:
+#  wird eine Datei. Deshalb je Ziel eine Liste in build.sh.conf [targets]:
 #
 #      DOWNLOAD[apk]='builds/apk/x_bookmark_manager.apk'
 #      DOWNLOAD[exe]='builds/exe/*.exe builds/exe/*.dll'
@@ -2491,7 +2541,7 @@ pull_artifacts() {
     err "  Auf '$h' gibt es kein builds/$target."
     err "  Vorhanden sind:"
     printf '%s\n' "$vorhanden" | sed 's/^/         /' >&2
-    err "  Trag in config/targets.conf ein, was du brauchst, z.B.:"
+    err "  Trag in build.sh.conf [targets] ein, was du brauchst, z.B.:"
     local ersterOrdner
     ersterOrdner=$(printf '%s\n' "$vorhanden" | head -1 | tr -d '/')
     err "      DOWNLOAD[$target]='builds/${ersterOrdner}/dein_ergebnis'"
@@ -2542,7 +2592,7 @@ move_to_host() {                 # move_to_host <host> <datei>
   local h=$1 datei=$2
   local path=${HOST_PATH[$h]:-} # getrennt -- siehe rsh_string
   if [[ -z $path ]]; then
-    err "  Host '$h' unbekannt -- siehe config/hosts.conf"
+    err "  Host '$h' unbekannt -- siehe build.sh.conf [hosts]"
     return 1
   fi
   if [[ ! -e $datei ]]; then
@@ -2771,7 +2821,7 @@ werkzeuge_von() {                # werkzeuge_von <ziel>
   #  was ein HOOK braucht -- mpv fuer einen Klang, adb zum Installieren,
   #  zip zum Packen -- war unsichtbar und wurde nie nachinstalliert.
   #  Zwei Wege, es anzumelden:
-  #    1. in config/targets.conf:   REQUIRE[exe]='mpv zip'
+  #    1. in build.sh.conf [targets]:   REQUIRE[exe]='mpv zip'
   #    2. im Hook selbst, als Kommentarzeile:
   #           # xbm-requires: mpv adb
   #       Das ist die bessere Stelle -- die Abhaengigkeit steht dort,
@@ -2785,7 +2835,7 @@ werkzeuge_von() {                # werkzeuge_von <ziel>
   #      # xbm-requires: winget::mpv = mpv-player.mpv-CI.MSVC
   #      # xbm-requires: apt::mpv = mpv
   #  Die erste Form nennt nur das Werkzeug; der Paketname kommt dann aus
-  #  config/packages.conf oder der eingebauten Tabelle. Die zweite Form
+  #  build.sh.conf [packages] oder der eingebauten Tabelle. Die zweite Form
   #  nennt beides und gilt VOR packages.conf -- so steht die Begruendung
   #  dort, wo sie hingehoert, und zieht beim Kopieren des Hooks mit.
   #
@@ -3038,7 +3088,7 @@ exec %s.exe "$@"
       err "  MIT MSVC geht es auch, ist aber unbequemer: cl.exe steht nur"
       err "  in einer Developer-Eingabeaufforderung im PATH. Dann muss"
       err "  vcvars64.bat vor cmake aufgerufen werden, etwa in"
-      err "  config/targets.conf:"
+      err "  build.sh.conf [targets]:"
       err "      CONF_CMD[exe]='cmd /c \"call vcvars64.bat && cmake ...\"'"
       err ""
       err "  ODER GANZ OHNE WINDOWS-MASCHINE -- Cross-Compile auf Linux:"
@@ -3737,13 +3787,13 @@ paket_id() {                     # paket_id <werkzeug> <verwalter>
   if [[ -n ${PAKET_AUS_HOOK["$v:$w"]:-} ]]; then
     printf '%s' "${PAKET_AUS_HOOK["$v:$w"]}"; return 0
   fi
-  # DANN config/packages.conf.
+  # DANN build.sh.conf [packages].
   # [Damit du Paketnamen ergaenzen kannst, ohne build.sh anzufassen.
   #  Aufbau, eine Zeile je Eintrag:
   #      winget:mpv   = mpv-player.mpv-CI.MSVC
   #      apt:mpv      = mpv
   #  Die eingebaute Tabelle unten bleibt als Rueckfall.]
-  if [[ -f config/packages.conf ]]; then
+  if [[ -f "$XBM_KONFDIR/packages.conf" ]]; then
     local zeile schl wert
     while IFS='=' read -r schl wert || [[ -n ${schl:-} ]]; do
       schl=$(trim "${schl:-}"); wert=$(trim "${wert:-}")
@@ -3751,7 +3801,7 @@ paket_id() {                     # paket_id <werkzeug> <verwalter>
       # Doppelpunkt ODER doppelter Doppelpunkt erlaubt.
       schl=${schl//::/:}
       if [[ $schl == "$v:$w" ]]; then printf '%s' "$wert"; return 0; fi
-    done < config/packages.conf
+    done < "$XBM_KONFDIR/packages.conf"
   fi
   case $v:$w in
     winget:cmake)  echo "Kitware.CMake" ;;
@@ -4173,9 +4223,9 @@ xbm_release_name() {              # xbm_release_name <ziel> <ersatz-ordner>
 
 xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
   local target=$1
-  local konfig=config/release.conf
+  local konfig="$XBM_KONFDIR/release.conf"
   if [[ ! -f $konfig ]]; then
-    err "  --run-only: config/release.conf fehlt (RELEASE_GIT_URL=... setzen)"
+    err "  --run-only: build.sh.conf [release] fehlt (RELEASE_GIT_URL=... setzen)"
     return 1
   fi
   local RELEASE_GIT_URL="" RELEASE_NOTES=""
@@ -4187,13 +4237,13 @@ xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
   fi
 
   # ZIEL -> (Schluessel in release.json, tatsaechlicher Ordnername unter
-  # builds/) -- BEIDES aus config/targets.conf, NICHTS davon fest in
+  # builds/) -- BEIDES aus build.sh.conf [targets], NICHTS davon fest in
   # build.sh verdrahtet. [build.sh soll unveraendert fuer andere Projekte
   # mit anderen Zielnamen nutzbar bleiben -- ein hier hart einprogram-
   # mierter Name wie "deb" oder "apk" wuerde das verhindern.
   #   RELEASE_NAME[ziel]  -- der Schluessel in release.json, den
   #     publish_release.sh beim Veroeffentlichen dieses Ziels verwendet
-  #     hat (siehe dort). MUSS in config/targets.conf gepflegt werden.
+  #     hat (siehe dort). MUSS in build.sh.conf [targets] gepflegt werden.
   #   DOWNLOAD[ziel]      -- existiert dort ohnehin schon (fuer den
   #     umgekehrten Weg, Dateien NACH einem Bau abzuholen); der Ordner-
   #     Anteil daraus (z.B. "builds/android" aus
@@ -4295,7 +4345,7 @@ xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
       #  Installieren mit "adb.exe: failed to stat ...: No such file or
       #  directory", obwohl das Herunterladen einwandfrei lief.
       #  Den erwarteten Namen liefert DOWNLOAD[ziel] aus
-      #  config/targets.conf -- dieselbe Angabe, aus der weiter oben
+      #  build.sh.conf [targets] -- dieselbe Angabe, aus der weiter oben
       #  schon der Zielordner stammt. Fehlt sie, bleibt es beim
       #  Release-Namen.]
       local wunschname=$dateiname
@@ -4333,7 +4383,7 @@ xbm_vielleicht_ausfuehren() {     # xbm_vielleicht_ausfuehren <ziel> <host> <mit
   # AUF DER ZIELMASCHINE GILT DER URSPRUENGLICHE HOSTNAME. [Der rekursive
   #  Fernaufruf lautet "--target apk@local" -- drueben heisst der Host
   #  also "local", und die Suche ging nach RUN_CMD[apk@local]. In
-  #  config/targets.conf steht aber RUN_CMD[apk@windows], unter dem
+  #  build.sh.conf [targets] steht aber RUN_CMD[apk@windows], unter dem
   #  Namen, unter dem der Auftrag ANGESTOSSEN wurde. Der steht in
   #  AS_HOST; run_hook nutzt ihn aus genau demselben Grund schon so.
   #  Ohne das fand --run-only apk@windows nichts, lud nichts herunter --
@@ -4346,10 +4396,10 @@ xbm_vielleicht_ausfuehren() {     # xbm_vielleicht_ausfuehren <ziel> <host> <mit
       # Bei --run-only ist das Ausfuehren der EINZIGE Zweck des Auftrags
       # -- ohne RUN_CMD gibt es nichts zu tun, das ist ein Fehler und
       # kein "erledigt".
-      err "  --run-only: weder RUN_CMD[${target}@${host}] noch RUN_CMD[$target] ist in config/targets.conf eingetragen"
+      err "  --run-only: weder RUN_CMD[${target}@${host}] noch RUN_CMD[$target] ist in build.sh.conf [targets] eingetragen"
       return 1
     fi
-    warn "  --run gesetzt, aber weder RUN_CMD[${target}@${host}] noch RUN_CMD[$target] ist in config/targets.conf eingetragen"
+    warn "  --run gesetzt, aber weder RUN_CMD[${target}@${host}] noch RUN_CMD[$target] ist in build.sh.conf [targets] eingetragen"
     return 0
   fi
   if (( mit_download )) && ! xbm_release_herunterladen "$target"; then
@@ -4529,7 +4579,7 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
   local build=${BUILD_CMD[$target]-}
   # Bei --exec gibt es keine Bau-Befehle -- also auch nichts zu pruefen.
   if (( ! EXEC_MODE )) && (( ! SYNC_ONLY )) && [[ -z $conf || -z $build ]]; then
-    err "unbekanntes Ziel '$target' (siehe config/targets.conf)"; return 1
+    err "unbekanntes Ziel '$target' (siehe build.sh.conf [targets])"; return 1
   fi
   # Ein Host ist OERTLICH, wenn er "local" heisst oder kein
   # benutzer@host hat. [Sonst muesste man denselben Rechner je nach
@@ -4538,7 +4588,7 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
   [[ $host == local ]] && ist_lokal=1
   [[ -n ${HOST_SSH[$host]+x} && -z ${HOST_SSH[$host]} ]] && ist_lokal=1
   if (( ! ist_lokal )) && [[ -z ${HOST_SSH[$host]:-} ]]; then
-    err "unbekannter Host '$host' (siehe config/hosts.conf)"; return 1
+    err "unbekannter Host '$host' (siehe build.sh.conf [hosts])"; return 1
   fi
   conf=${conf//\$\{JOBS\}/$JOBS}
   build=${build//\$\{JOBS\}/$JOBS}
@@ -4846,7 +4896,7 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
           eval_rc=1
         fi
       else
-        warn "  --publish gesetzt, aber PUBLISH_CMD[$target] ist in config/targets.conf nicht eingetragen"
+        warn "  --publish gesetzt, aber PUBLISH_CMD[$target] ist in build.sh.conf [targets] nicht eingetragen"
       fi
     fi
     # --run: NACH ERFOLGREICHEM BAU RUN_CMD[ziel] STARTEN -- direkt das
@@ -4902,7 +4952,7 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
           *"Connection timed out"*|*"No route to host"*)
             err "  -> Rechner aus, im Ruhezustand, oder anderes Netz/VPN?" ;;
           *"Name or service not known"*|*"Could not resolve"*)
-            err "  -> Der Name laesst sich nicht aufloesen. In config/hosts.conf" 
+            err "  -> Der Name laesst sich nicht aufloesen. In build.sh.conf [hosts]" 
             err "     eine IP statt des Namens eintragen." ;;
           *"Permission denied"*)
             err "  -> Anmeldung abgelehnt: Schluessel oder Passwort pruefen." ;;
@@ -5565,7 +5615,7 @@ run_all() {
   #  halten will, wartet: while [[ -f builds/.xbm-lauf.lock ]]; do sleep 1; done]
   mkdir -p builds
   : > builds/.xbm-lauf.lock
-  trap 'rm -f builds/.xbm-lauf.lock' EXIT
+  trap 'rm -f builds/.xbm-lauf.lock; konfig_aufraeumen' EXIT
   # PHASEN UM DEN GANZEN LAUF.
   # [pre-job/post-job laufen je AUFTRAG. Fuer "nur wenn ALLE gelangen"
   #  bzw. "sobald EINER scheitert" braucht es eine Ebene darueber --
@@ -5859,7 +5909,7 @@ zeige_liste() {
   local n
   local -a hnamen=("${!HOST_SSH[@]}")
   if (( ${#hnamen[@]} == 0 )); then
-    log "  (keine -- weder global noch in config/hosts.conf)"
+    log "  (keine -- weder global noch in build.sh.conf [hosts])"
   else
     printf '  %-14s %-8s %-24s %-20s %s\n' NAME OS "BENUTZER@HOST" PFAD GIT
     for n in $(printf '%s\n' "${hnamen[@]}" | sort); do
@@ -5873,7 +5923,7 @@ zeige_liste() {
   log "ZIELE"
   local -a znamen=("${!CONF_CMD[@]}")
   if (( ${#znamen[@]} == 0 )); then
-    log "  (keine -- config/targets.conf fehlt oder ist leer)"
+    log "  (keine -- build.sh.conf [targets] fehlt oder ist leer)"
   else
     for n in $(printf '%s\n' "${znamen[@]}" | sort); do
       printf '  %-10s %s\n' "$n" "$(printf '%s' "${BUILD_CMD[$n]:-}" | head -c 60)"
@@ -5927,8 +5977,8 @@ if [[ -n $MUTTER_HOST ]]; then
     for _hf in "${XBM_HOSTS_GLOBAL[@]}"; do
       [[ -f $_hf ]] && hosts_einlesen "$_hf"
     done
-    hosts_einlesen "config/hosts.conf"
-    [[ -f config/targets.conf ]] && source config/targets.conf
+    hosts_einlesen "$XBM_KONFDIR/hosts.conf"
+    [[ -f "$XBM_KONFDIR/targets.conf" ]] && source "$XBM_KONFDIR/targets.conf"
   fi
 fi
 

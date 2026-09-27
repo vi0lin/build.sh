@@ -24,4 +24,5 @@ create_release_repository() {
 # --install
 clone_git_server_binary() {
   # git clone -b releases https://github.com/vi0lin/git_server
+  # linking *.service files
 }

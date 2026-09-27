@@ -142,10 +142,23 @@ if [[ -z $version ]]; then
   fi
 fi
 
-konfig=config/release.conf
-[[ -f $konfig ]] || { echo "Fehlt: $konfig (RELEASE_GIT_URL=... setzen)" >&2; exit 1; }
-# shellcheck disable=SC1090
-source "$konfig"
+# KONFIGURATION: Abschnitt [release] aus build.sh.conf im Projektstamm
+# (dieselbe Datei wie fuer build.sh); ohne sie weiterhin config/release.conf.
+konfdatei=${XBM_KONF_DATEI:-build.sh.conf}
+if [[ -f $konfdatei ]]; then
+  konfig="$konfdatei [release]"
+  # Nur den Abschnitt [release] als Bash ausfuehren -- nichts anderes aus
+  # der Datei (die Host-Tabelle etwa waere kein gueltiges Bash).
+  eval "$(awk '
+    { sub(/\r$/, "") }
+    /^[[:space:]]*\[[A-Za-z_-]+\][[:space:]]*$/ { s=$0; gsub(/[][ \t]/,"",s); im = (tolower(s)=="release"); next }
+    im { print }' "$konfdatei")"
+else
+  konfig=config/release.conf
+  [[ -f $konfig ]] || { echo "Fehlt: $konfdatei mit [release] (oder $konfig) -- RELEASE_GIT_URL=... setzen" >&2; exit 1; }
+  # shellcheck disable=SC1090
+  source "$konfig"
+fi
 [[ -n ${RELEASE_GIT_URL:-} ]] || { echo "RELEASE_GIT_URL fehlt in $konfig" >&2; exit 1; }
 
 arbeitsordner=$(mktemp -d)
