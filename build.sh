@@ -1013,6 +1013,13 @@ XBM_HOSTS_GLOBAL+=("$HOME/.config/xbm/hosts.conf" "/etc/xbm/hosts.conf")
 # Eine andere Datei: XBM_KONF_DATEI=/pfad/zur/datei build.sh ...
 # ---------------------------------------------------------------------------
 XBM_KONF_DATEI=${XBM_KONF_DATEI:-build.sh.conf}
+# UNVEROEFFENTLICHTE FASSUNG BEVORZUGEN: <datei>.unreleased. [Darin stehen
+#  Passwoerter und private Adressen; die Datei bleibt per .gitignore aus
+#  dem Repository, waehrend build.sh.conf als Beispiel veroeffentlicht
+#  werden kann. Bauhosts bekommen die .unreleased NICHT ueber Git --
+#  build.sh schickt sie deshalb mit dem Werkzeug dorthin (siehe
+#  xbm_werkzeug_senden).]
+[[ -f "$XBM_KONF_DATEI.unreleased" ]] && XBM_KONF_DATEI="$XBM_KONF_DATEI.unreleased"
 XBM_KONFDIR=config
 konfig_laden() {
   [[ -f $XBM_KONF_DATEI ]] || return 0
@@ -4136,6 +4143,22 @@ hat_action_hooks() {             # hat_action_hooks <ziel> <host>
 bau_eval() {                      # bau_eval <phase: konfigurieren|bauen> <urspruenglicher-befehl>
   local phase=$1 orig=$2 rc
   lauf_notiz "${target}@${host}" "$phase" "-" gestartet
+  # UMGEBUNG FUER DEN BAU:
+  #  XBM_RELEASE_NAME  -- der Name, unter dem PUBLISH_CMD veroeffentlicht
+  #                       (aus dem Befehl abgeleitet; ohne Angabe der
+  #                       Bauordnername). Damit sucht die App in
+  #                       release.json unter GENAU diesem Namen -- sonst
+  #                       laegen "x_bookmark_manager_exe" (veroeffentlicht)
+  #                       und "exe" (gesucht) auseinander, und ein Update
+  #                       wuerde nie gefunden. CMake liest ihn aus der
+  #                       Umgebung (siehe CMakeLists.txt des Projekts).
+  #  XBM_WERKZEUG_DIR  -- Ordner mit build.sh, publish_release.sh und
+  #                       toolchains/, z.B. fuer
+  #                       -DCMAKE_TOOLCHAIN_FILE=$XBM_WERKZEUG_DIR/toolchains/...
+  local _ordner="builds/$target"
+  [[ -n ${DOWNLOAD[$target]:-} ]] && _ordner=$(dirname "${DOWNLOAD[$target]}")
+  export XBM_RELEASE_NAME; XBM_RELEASE_NAME=$(xbm_release_name "$target" "$_ordner")
+  export XBM_WERKZEUG_DIR; XBM_WERKZEUG_DIR=$(xbm_selbst_ordner 2>/dev/null || pwd)
   if [[ -z ${HOOKS_ONLY_MODE:-} ]]; then
     eval "$orig"; rc=$?
     (( rc == 0 )) && lauf_notiz "${target}@${host}" "$phase" "-" ok \
@@ -4182,6 +4205,20 @@ xbm_werkzeug_senden() {           # xbm_werkzeug_senden <host> <pfad> <ziel>
   for f in build.sh publish_release.sh; do
     [[ -f $dir/$f ]] && dateien+=("$f")
   done
+  # ZUSAETZLICH MITSCHICKEN (aus dem Werkzeugordner):
+  #  - toolchains/  CMake-Toolchain-Dateien fuer Kreuzbauten. Sie
+  #    beschreiben Compiler, nicht Projekte -- deshalb liegen sie beim
+  #    Werkzeug, und jedes Projekt nutzt sie ueber $XBM_WERKZEUG_DIR.
+  local tarargs=(-C "$dir" "${dateien[@]}") meldung="${dateien[*]}"
+  [[ -d $dir/toolchains ]] && { tarargs+=(toolchains); meldung+=" toolchains/"; }
+  # ... und aus dem PROJEKT: die unveroeffentlichte Konfiguration. [Sie
+  #  ist nicht im Git, der Abgleich bringt sie also nicht auf den Host;
+  #  ohne sie laese der Host dort die Beispieldatei -- ohne Passwoerter.]
+  local konf="${XBM_KONF_DATEI##*/}"
+  if [[ $konf == *.unreleased && -f $XBM_KONF_DATEI ]]; then
+    tarargs+=(-C "$(cd "$(dirname "$XBM_KONF_DATEI")" && pwd)" "$konf")
+    meldung+=" $konf"
+  fi
   local altlog="builds/logs/${t}@local.log"
   case ${HOST_OS[$h]:-posix} in
     # chmod +x: publish_release.sh wird ueber den PATH aufgerufen und
@@ -4196,11 +4233,11 @@ xbm_werkzeug_senden() {           # xbm_werkzeug_senden <host> <pfad> <ziel>
     return 0
   fi
   build_remote_argv "$h" "$befehl"
-  if ! tar -C "$dir" -czf - "${dateien[@]}" | "${SSH_ARGV[@]}" >/dev/null 2>&1; then
+  if ! tar -czf - "${tarargs[@]}" | "${SSH_ARGV[@]}" >/dev/null 2>&1; then
     err "  Werkzeug (${dateien[*]}) liess sich nicht nach '${h}:$p' uebertragen"
     return 1
   fi
-  log "  Werkzeug -> $h: ${dateien[*]} (aus $dir)"
+  log "  Werkzeug -> $h: $meldung (aus $dir)"
 }
 
 xbm_release_name() {              # xbm_release_name <ziel> <ersatz-ordner>

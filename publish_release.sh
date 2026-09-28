@@ -145,6 +145,8 @@ fi
 # KONFIGURATION: Abschnitt [release] aus build.sh.conf im Projektstamm
 # (dieselbe Datei wie fuer build.sh); ohne sie weiterhin config/release.conf.
 konfdatei=${XBM_KONF_DATEI:-build.sh.conf}
+# .unreleased bevorzugen -- dieselbe Regel wie in build.sh.
+[[ -f "$konfdatei.unreleased" ]] && konfdatei="$konfdatei.unreleased"
 if [[ -f $konfdatei ]]; then
   konfig="$konfdatei [release]"
   # Nur den Abschnitt [release] als Bash ausfuehren -- nichts anderes aus
