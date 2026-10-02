@@ -1,5 +1,6 @@
 build.zip
 todo.txt
 *.unreleased
-u released/
+unreleased/
 /*.zip
+
