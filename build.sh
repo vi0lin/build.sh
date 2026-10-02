@@ -92,6 +92,9 @@ MOVE_TO_HOST=""
 MOVE_TO_DATEI=""
 CLEAN=0
 CLEANDEEP=0
+CLEANALL=0
+CLEANONLY=0
+NO_PUSH=0
 VERBOSE=0
 AS_HOST=""
 FULL_SYNC=0
@@ -538,7 +541,10 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --zustand)        xbm_zustand; exit 0 ;;   # siehe xbm_zustand -- NUR lesen
     --clean)          CLEAN=1; shift ;;
-    --clean-deep)      CLEANDEEP=1; shift ;;
+    --clean-deep)     CLEANDEEP=1; shift ;;
+    --clean-all)      CLEANALL=1; shift ;;
+    --clean-only)     CLEANONLY=1; shift ;;
+    --no-push)        NO_PUSH=1; shift ;;
     -t|--target)
       IFS=',' read -ra items <<< "$2"
       for item in "${items[@]}"; do add_target "$item"; done
@@ -794,8 +800,21 @@ Aufruf:
   build.sh [ziel@host ...] [-t ziel@host,...] [-o vorgabe-host] [-j N]
            [-p N] [--configure-only] [--build-only] [--dry-run] [-v]
 
---clean
---clean-deep
+--clean          Objektdateien des Ziels loeschen (cmake --target clean),
+                 Cache und Konfiguration bleiben -- schneller Neubau
+--clean-deep     Bauordner des Ziels (builds/<ziel>) komplett loeschen:
+                 auch CMake-Cache und Konfiguration. NOETIG, nachdem
+                 Quelldateien entfernt oder verschoben wurden -- der Cache
+                 kennt sonst noch die alten Pfade
+--clean-all      wie --clean-deep fuer ALLE Ziele, dazu .deps-cache
+                 (heruntergeladene Abhaengigkeiten) -- alles, was ein Bau
+                 je angelegt hat; builds/logs bleibt
+--no-push        lokalen Stand NICHT vor dem Lauf committen und auf den
+                 Git-Server pushen (Vorgabe: bei entfernten Hosts wird er
+                 hochgeladen -- sonst bauen die Hosts alten Code)
+--clean-only     nur saeubern, danach NICHT bauen (mit einer der drei
+                 Optionen oben); gilt auch auf den entfernten Hosts:
+                   build.sh --clean-deep --clean-only deb@local exe@windows
 --target
 --on
 --jobs
@@ -1227,6 +1246,24 @@ for _hf in "${XBM_HOSTS_GLOBAL[@]}"; do
 done
 hosts_einlesen "$XBM_KONFDIR/hosts.conf"
 
+# ALLE HOSTS DER AUFTRAEGE VORAB PRUEFEN -- sonst startet der ganze Lauf,
+# nur um an einem Tippfehler ("buldserver") zu scheitern; abhaengige
+# Auftraege (--run-only) werden dann ebenfalls uebersprungen.
+if (( ! LIST_MODE )); then
+  _unbekannt=()
+  for _h in "${HOSTS[@]}"; do
+    [[ -z $_h || $_h == local ]] && continue
+    [[ -n ${HOST_OS[$_h]+x} ]] || _unbekannt+=("$_h")
+  done
+  if (( ${#_unbekannt[@]} )); then
+    err "unbekannte Hosts: ${_unbekannt[*]}"
+    err "  bekannt laut $XBM_KONF_DATEI [hosts]: ${!HOST_OS[*]}"
+    err "  (Tippfehler? -- nichts gestartet)"
+    exit 2
+  fi
+  unset _unbekannt _h
+fi
+
 # ---------------------------------------------------------------------------
 # SSH-Aufruf als ARRAY zusammensetzen -- nie als Zeichenkette.
 # [Eine Zeichenkette muesste erneut zerlegt werden, und genau dabei gehen
@@ -1401,7 +1438,50 @@ git_pull_host() {                # git_pull_host <host> <pfad> <url>
   # angelegtes Repo kennt refs/remotes/origin/HEAD nie, und JEDER Sync
   # auf so einem Host wuerde sonst mit "ambiguous argument origin/HEAD"
   # scheitern -- nicht nur der allererste.
-  local mtime_schonend='
+
+# ---------------------------------------------------------------------------
+# SUBMODULE HOLEN -- JE SUBMODUL EINZELN UND REKURSIV (POSIX sh).
+# [Ein einziges "git submodule update --init --recursive" bricht beim ERSTEN
+#  Problem komplett ab -- ein Gitlink ohne .gitmodules-Eintrag ("No url
+#  found"), ein fehlender Commit -- und laesst alle uebrigen Submodule leer
+#  zurueck. So blieb external/general_c auf allen Hosts leer, weil in
+#  general_c ein unbeteiligtes Vulkan-Beispiel als Gitlink haengt.
+#  Hier: vorher "git submodule sync" (geaenderte URLs in .gitmodules werden
+#  sonst NIE uebernommen -- die einmal registrierte URL bleibt in .git/
+#  config), dann jedes Submodul fuer sich: normal, sonst Branch-Stand
+#  (--remote) mit Warnung, sonst Warnung und WEITER mit dem naechsten.
+#  Eintraege mit "update = none" werden uebersprungen, Gitlinks ohne
+#  Eintrag ignoriert. Danach dasselbe in jedem geholten Submodul.]
+# Dieser Text wird in die Sync-Scripts der Hosts eingebettet.
+# ---------------------------------------------------------------------------
+XBM_SM_FN='
+xbm_sm_holen() {
+  xd=$1
+  [ -f "$xd/.gitmodules" ] || return 0
+  ( cd "$xd" && git submodule sync -q 2>/dev/null ) || true
+  for xp in $(sed -n "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p" "$xd/.gitmodules"); do
+    xn=$( cd "$xd" && git config -f .gitmodules --get-regexp "\.path$" 2>/dev/null | grep " $xp$" | sed "s/^submodule\.//; s/\.path .*//" | head -n 1 )
+    xu=$( cd "$xd" && git config -f .gitmodules --get "submodule.$xn.update" 2>/dev/null )
+    [ "$xu" = none ] && continue
+    if ( cd "$xd" && git submodule update --init --depth 1 -- "$xp" 2>&1 ); then :
+    elif ( cd "$xd" && git submodule update --init --remote -- "$xp" 2>&1 ); then
+      echo "WARNUNG: Submodul $xd/$xp: eingetragener Commit fehlt auf dem Server -- Branch-Stand geholt. Bitte Verweis richtigstellen." >&2
+    else
+      echo "WARNUNG: Submodul $xd/$xp konnte nicht geholt werden -- weiter mit den uebrigen" >&2
+    fi
+    ( xbm_sm_holen "$xd/$xp" )   # Subshell: POSIX sh hat kein local -- sonst ueberschreibt die Rekursion xd/xp des Aufrufers
+  done
+}
+'
+  local mtime_schonend="$XBM_SM_FN"'
+    echo "sync: auf $(hostname 2>/dev/null || echo ?) gestartet"
+    # STILLSTAND-SCHUTZ. [Git wartet auf einer eingeschlafenen HTTP-
+    #  Verbindung unbegrenzt -- der Buildserver hing 135 s still, die
+    #  Wiederholungen kamen nie dran. Unter 1 kB/s fuer 45 s gilt der
+    #  Transfer als tot und wird abgebrochen; dann greift die Wiederholung.
+    #  Gilt per Umgebung fuer jeden git-Aufruf hier, Submodule eingeschlossen.]
+    GIT_HTTP_LOW_SPEED_LIMIT=1000; GIT_HTTP_LOW_SPEED_TIME=45
+    export GIT_HTTP_LOW_SPEED_LIMIT GIT_HTTP_LOW_SPEED_TIME
     ALT_STAND=$(git rev-parse HEAD 2>/dev/null)
     # FETCH-FEHLSCHLAG EXPLIZIT ABFANGEN, MIT WIEDERHOLVERSUCHEN. [Vorher
     #  haengte "&&" nur an der NAECHSTEN Zeile (git diff) -- alles danach
@@ -1487,35 +1567,17 @@ git_pull_host() {                # git_pull_host <host> <pfad> <url>
 $(sed -n "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p" .gitmodules 2>/dev/null)
 XBMEOF
     fi
-    if grep -qE "^external/" .xbm-git-geaendert.tmp 2>/dev/null \
-       || [ "$xbm_submodul_fehlt" = 1 ]; then
-      (git submodule update --init --recursive --depth 1 2>&1 ||
-       {
-         # SELBSTHEILUNG BEI VERALTETEM VERWEIS. [Der haeufigste Grund
-         #  fuer einen Fehlschlag hier: das Hauptprojekt zeigt auf einen
-         #  Commit, den es auf dem Submodul-Server gar nicht (mehr) gibt
-         #  -- "Server does not allow request for unadvertised object".
-         #  Der normale Weg kann das nicht aufloesen und laesst den
-         #  Ordner LEER zurueck; CMake bricht dann mit "does not contain
-         #  a CMakeLists.txt file" ab, und zwar bei JEDEM Lauf aufs
-         #  Neue. "--remote" holt stattdessen den aktuellen Stand des im
-         #  .gitmodules eingetragenen Branches -- damit ist der Ordner
-         #  wenigstens befuellt und der Bau kann durchlaufen.
-         #  ACHTUNG: das ist eine Notbremse, kein Ersatz fuer das
-         #  Richtigstellen des Verweises -- deshalb die deutliche
-         #  Meldung.]
-         echo "WARNUNG: git submodule update fehlgeschlagen -- der im Hauptprojekt eingetragene Commit existiert auf dem Submodul-Server offenbar nicht (mehr)." >&2
-         echo "         Versuche Notbremse: aktuellen Branch-Stand holen (git submodule update --remote) ..." >&2
-         if git submodule update --init --recursive --remote 2>&1; then
-           echo "         Notbremse hat geholfen -- der Baum ist befuellt." >&2
-           echo "         BITTE TROTZDEM RICHTIGSTELLEN, sonst passiert das bei jedem Lauf:" >&2
-           echo "           cd external/pdf && git fetch origin && git checkout origin/main" >&2
-           echo "           cd ../.. && git add external/pdf && git commit -m \"pdf-Verweis\" && git push" >&2
-         else
-           echo "         Auch die Notbremse schlug fehl -- external/pdf bleibt leer, der Bau wird scheitern." >&2
-         fi
-       })
-    fi
+    # IMMER: [Vorher nur bei Aenderungen unter external/ oder direkt leerem
+    #  Ordner. general_c war aber nur INNEN leer (netlink/ fehlte) und
+    #  "auf dem neuesten Stand" -- die Logik lief nicht, CMake brach ab.
+    #  Ist alles da, kostet der Durchlauf nur ein paar git-Aufrufe.]
+    xbm_sm_holen .
+    # ZEILENENDEN AUCH IN DEN SUBMODULEN FESTLEGEN. [core.autocrlf galt nur
+    #  im Hauptprojekt; in den Submodulen wandelte Git auf Windows jede
+    #  Datei nach CRLF -- alles galt als "geaendert", Warnflut, und Checkouts
+    #  konnten stocken. Nur auf den Bauhosts: hier ist der committete Stand
+    #  massgeblich, lokale Aenderungen gibt es nicht.]
+    git submodule foreach --recursive --quiet "git config core.autocrlf false; git config core.eol lf; git checkout -q -- . 2>/dev/null || true" >/dev/null 2>&1 || true
     # NACHKONTROLLE: REPOSITORY DA, ABER ARBEITSBAUM LEER.
     # [Genau dieser Zustand lag auf buildserver vor: external/pdf hatte
     #  ein vollstaendiges .git (git reflog funktionierte dort, HEAD stand
@@ -1613,7 +1675,15 @@ XBMSMEOF
   # revision". FETCH_HEAD zeigt dagegen IMMER auf das, was der letzte
   # "git fetch" tatsaechlich geholt hat -- unabhaengig davon, ob die
   # Referenz vorher schon existierte.]
-  local erstumstellung='
+  local erstumstellung="$XBM_SM_FN"'
+    echo "sync: Erstumstellung auf $(hostname 2>/dev/null || echo ?) gestartet"
+    # STILLSTAND-SCHUTZ. [Git wartet auf einer eingeschlafenen HTTP-
+    #  Verbindung unbegrenzt -- der Buildserver hing 135 s still, die
+    #  Wiederholungen kamen nie dran. Unter 1 kB/s fuer 45 s gilt der
+    #  Transfer als tot und wird abgebrochen; dann greift die Wiederholung.
+    #  Gilt per Umgebung fuer jeden git-Aufruf hier, Submodule eingeschlossen.]
+    GIT_HTTP_LOW_SPEED_LIMIT=1000; GIT_HTTP_LOW_SPEED_TIME=45
+    export GIT_HTTP_LOW_SPEED_LIMIT GIT_HTTP_LOW_SPEED_TIME
     git init -q &&
     (git remote add origin "'"$url"'" 2>/dev/null || git remote set-url origin "'"$url"'") &&
     (fetch_ok=0
@@ -1638,32 +1708,7 @@ XBMSMEOF
         git reset --hard FETCH_HEAD >/dev/null 2>&1
       echo ok > .xbm-lf.ok 2>/dev/null
     fi
-    (git submodule update --init --recursive --depth 1 2>&1 ||
-       {
-         # SELBSTHEILUNG BEI VERALTETEM VERWEIS. [Der haeufigste Grund
-         #  fuer einen Fehlschlag hier: das Hauptprojekt zeigt auf einen
-         #  Commit, den es auf dem Submodul-Server gar nicht (mehr) gibt
-         #  -- "Server does not allow request for unadvertised object".
-         #  Der normale Weg kann das nicht aufloesen und laesst den
-         #  Ordner LEER zurueck; CMake bricht dann mit "does not contain
-         #  a CMakeLists.txt file" ab, und zwar bei JEDEM Lauf aufs
-         #  Neue. "--remote" holt stattdessen den aktuellen Stand des im
-         #  .gitmodules eingetragenen Branches -- damit ist der Ordner
-         #  wenigstens befuellt und der Bau kann durchlaufen.
-         #  ACHTUNG: das ist eine Notbremse, kein Ersatz fuer das
-         #  Richtigstellen des Verweises -- deshalb die deutliche
-         #  Meldung.]
-         echo "WARNUNG: git submodule update fehlgeschlagen -- der im Hauptprojekt eingetragene Commit existiert auf dem Submodul-Server offenbar nicht (mehr)." >&2
-         echo "         Versuche Notbremse: aktuellen Branch-Stand holen (git submodule update --remote) ..." >&2
-         if git submodule update --init --recursive --remote 2>&1; then
-           echo "         Notbremse hat geholfen -- der Baum ist befuellt." >&2
-           echo "         BITTE TROTZDEM RICHTIGSTELLEN, sonst passiert das bei jedem Lauf:" >&2
-           echo "           cd external/pdf && git fetch origin && git checkout origin/main" >&2
-           echo "           cd ../.. && git add external/pdf && git commit -m \"pdf-Verweis\" && git push" >&2
-         else
-           echo "         Auch die Notbremse schlug fehl -- external/pdf bleibt leer, der Bau wird scheitern." >&2
-         fi
-       })
+    xbm_sm_holen .
     find . -type f \( -name "*.sh" -o -path "./hooks/*" \) \
            -not -path "./.git/*" 2>/dev/null | while read -r datei; do
       if ! tr -d "\r" < "$datei" 2>/dev/null | cmp -s - "$datei" 2>/dev/null; then
@@ -1720,14 +1765,14 @@ XBMSMEOF
       # Commit fehl (gibt es auf dem Submodul-Server nicht mehr), wird
       # der aktuelle Branch-Stand geholt, damit external/pdf nicht leer
       # bleibt und CMake nicht abbricht.
-      local b_nacharbeit="( cd /d \"$w\" & git config core.autocrlf false & git config core.eol lf & ( if not exist \".xbm-lf.ok\" ( git rm --cached -r -q . & git reset --hard HEAD & echo ok> .xbm-lf.ok ) ) & ( git submodule update --init --recursive --depth 1 || ( echo WARNUNG: Submodul-Verweis zeigt ins Leere -- hole aktuellen Branch-Stand & git submodule update --init --recursive --remote ) ) )"
+      local b_nacharbeit="( cd /d \"$w\" & set GIT_HTTP_LOW_SPEED_LIMIT=1000& set GIT_HTTP_LOW_SPEED_TIME=45& git config core.autocrlf false & git config core.eol lf & ( if not exist \".xbm-lf.ok\" ( git rm --cached -r -q . & git reset --hard HEAD & echo ok> .xbm-lf.ok ) ) & ( git submodule sync --recursive & git submodule foreach --recursive --quiet \"git config core.autocrlf false; git config core.eol lf; git checkout -q -- . 2>/dev/null || true\" & ( git submodule update --init --recursive --depth 1 || ( echo WARNUNG: Submodule im Ganzen fehlgeschlagen -- hole sie einzeln & for /f \"tokens=2\" %p in ('git config -f .gitmodules --get-regexp path') do ( git submodule update --init --depth 1 -- %p & for /f \"tokens=2\" %q in ('git -C %p config -f .gitmodules --get-regexp path 2^>nul') do git -C %p submodule update --init --depth 1 -- %q ) ) ) ) )"
       befehl="$a_kritisch && $b_nacharbeit"
       ;;
     gitbash|wsl)
-      befehl="if [ -d '$p/.git' ]; then cd '$p' && ($mtime_schonend); elif [ -d '$p' ] && [ -n \"\$(ls -A '$p' 2>/dev/null)\" ]; then cd '$p' && ($erstumstellung); else git clone --depth 1 --recurse-submodules --shallow-submodules '$url' '$p'; fi"
+      befehl="$XBM_SM_FN if [ -d '$p/.git' ]; then cd '$p' && ($mtime_schonend); elif [ -d '$p' ] && [ -n \"\$(ls -A '$p' 2>/dev/null)\" ]; then cd '$p' && ($erstumstellung); else GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=45 git clone --depth 1 '$url' '$p' && cd '$p' && GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=45 xbm_sm_holen .; fi"
       ;;
     *)
-      befehl="if [ -d '$p/.git' ]; then cd '$p' && ($mtime_schonend); elif [ -d '$p' ] && [ -n \"\$(ls -A '$p' 2>/dev/null)\" ]; then cd '$p' && ($erstumstellung); else mkdir -p '$p' && git clone --depth 1 --recurse-submodules --shallow-submodules '$url' '$p'; fi"
+      befehl="$XBM_SM_FN if [ -d '$p/.git' ]; then cd '$p' && ($mtime_schonend); elif [ -d '$p' ] && [ -n \"\$(ls -A '$p' 2>/dev/null)\" ]; then cd '$p' && ($erstumstellung); else mkdir -p '$p' && GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=45 git clone --depth 1 '$url' '$p' && cd '$p' && GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=45 xbm_sm_holen .; fi"
       ;;
   esac
 
@@ -1770,7 +1815,17 @@ XBMSMEOF
   fi
 
   local rc=0
-  remote "$h" "$befehl" || rc=1
+  remote "$h" "$befehl" || rc=$?
+  # EINMAL WIEDERHOLEN, wenn nicht das Script, sondern die VERBINDUNG
+  # gescheitert ist. [Ein Host, der 135 s lang keine einzige Zeile liefert
+  #  und dann "fehlgeschlagen" meldet, hat meist gar nicht angefangen: ssh
+  #  255 (Verbindung weg/Timeout) oder sshpass 5 (Passwort abgelehnt --
+  #  ohne jede Meldung). Das war bisher unsichtbar und galt als
+  #  "git clone/pull fehlgeschlagen".]
+  if (( rc == 255 )); then
+    warn "  Verbindung zu '$h' abgebrochen (ssh 255) -- in 10 s noch ein Versuch"
+    sleep 10; rc=0; remote "$h" "$befehl" || rc=$?
+  fi
 
   if [[ -n $herz_stop ]]; then
     : > "$herz_stop"
@@ -1780,7 +1835,12 @@ XBMSMEOF
 
   if (( rc )); then
     lauf_notiz "${target}@${h}" sync "git: $url" fehlgeschlagen
-    err "  git clone/pull auf '$h' fehlgeschlagen -- $url erreichbar?"
+    case $rc in
+      255) err "  git clone/pull auf '$h': SSH-Verbindung gescheitert (255) -- Host an? sshd? Firewall?  Probe: ssh ${HOST_SSH[$h]} echo ok" ;;
+      5)   err "  git clone/pull auf '$h': sshpass meldet 'Passwort abgelehnt' (5) -- Passwort in build.sh.conf.unreleased pruefen" ;;
+      6)   err "  git clone/pull auf '$h': Host-Schluessel unbekannt (sshpass 6) -- einmal von Hand: ssh ${HOST_SSH[$h]}" ;;
+      *)   err "  git clone/pull auf '$h' fehlgeschlagen (Rueckgabe $rc) -- $url vom Host aus erreichbar?  Probe: ssh ${HOST_SSH[$h]} 'cd ${HOST_PATH[$h]} && git fetch --depth 1 origin && echo ok'" ;;
+    esac
     return 1
   fi
   mkdir -p "$SYNC_DIR"
@@ -2711,6 +2771,12 @@ run_hook() {                     # run_hook <phase> <ziel> <host> [status]
   shopt -s nullglob
   for f in hooks/*.sh; do
     local basis=${f##*/}; basis=${basis%.sh}
+    # REIHENFOLGE: optionale Nummer "NN-" am Anfang (10-post-job.apk.sh).
+    # [Treffen mehrere Hooks auf einen Auftrag, liefen sie bisher nach
+    #  Allgemeinheit und dann alphabetisch -- fuer "erst Ton, dann Nachbau
+    #  anstossen" braucht es eine ausdrueckliche Ordnung. Ohne Nummer gilt 50.]
+    local nummer=50
+    if [[ $basis =~ ^([0-9]+)-(.*)$ ]]; then nummer=${BASH_REMATCH[1]}; basis=${BASH_REMATCH[2]}; fi
     # Muss mit der Phase beginnen, gefolgt von Ende, '.' oder '@'.
     # [Ohne diese Pruefung wuerde "pre-job" auch auf "pre-jobber"
     #  passen.]
@@ -2760,14 +2826,14 @@ run_hook() {                     # run_hook <phase> <ziel> <host> [status]
     [[ -n $wann  ]] && ((rang++))
     [[ -n $ziele ]] && ((rang++))
     [[ -n $hosts ]] && ((rang++))
-    treffer+=("${rang}|${f}")
+    treffer+=("${nummer}|${rang}|${f}")
   done
   shopt -u nullglob
   (( ${#treffer[@]} == 0 )) && return 0
 
   local eintrag skript
   while IFS= read -r eintrag; do
-    skript=${eintrag#*|}
+    skript=${eintrag#*|}; skript=${skript#*|}
     # KEIN chmod +x noetig -- gestartet wird ohnehin mit bash.
     log "  Hook: $skript"
     # LIVE IN DER STATUSFLAECHE ZEIGEN, WELCHER HOOK GERADE LAEUFT.
@@ -2789,7 +2855,7 @@ run_hook() {                     # run_hook <phase> <ziel> <host> [status]
       return 1
     fi
     lauf_notiz "${target}@${host}" hook "$skript" ok
-  done < <(printf '%s\n' "${treffer[@]}" | sort -t'|' -k1,1n -k2,2)
+  done < <(printf '%s\n' "${treffer[@]}" | sort -t'|' -k1,1n -k2,2n -k3,3)
   return 0
 }
 
@@ -4225,8 +4291,8 @@ xbm_werkzeug_senden() {           # xbm_werkzeug_senden <host> <pfad> <ziel>
     # muss dafuer ausfuehrbar sein -- unabhaengig davon, welche Rechte die
     # Dateien hier hatten.
     cmd) befehl="cd /d $(winpfad "$p") && bash -c \"tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'\"" ;;
-    wsl) befehl="bash -c \"cd '$p' && tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'\"" ;;
-    *)   befehl="cd '$p' && tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'" ;;
+    wsl) befehl="bash -c \"mkdir -p '$p' && cd '$p' && tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'\"" ;;
+    *)   befehl="mkdir -p '$p' && cd '$p' && tar -xzf - && chmod +x ${dateien[*]} && rm -f '$altlog'" ;;
   esac
   if (( DRY_RUN )); then
     log "  [Probelauf] Werkzeug (${dateien[*]}) -> ${h}:$p"
@@ -4305,8 +4371,37 @@ xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
   trap "rm -rf '$arbeitsordner'" RETURN
 
   log "  --run-only: hole Release '$plattform' von $RELEASE_GIT_URL"
-  if ! git clone --depth 1 --branch main "$RELEASE_GIT_URL" "$arbeitsordner/releases" -q 2>/dev/null
-  then
+  mkdir -p "$arbeitsordner/releases"
+  # EINZELNE DATEIEN PER HTTP STATT GANZEM KLON. [git clone --depth 1 holte
+  #  ALLE Pakete aller Plattformen am Zweigende -- auf Windows durch WSL auf
+  #  /mnt/c dauerte das 3:25 min fuer ein APK, das in 10 s installiert ist.
+  #  Der eigene Git-Server streamt eine Datei unter
+  #  <server>/<repo>/raw/branch/main/<datei>; GitHub unter
+  #  raw.githubusercontent.com. Klappt das nicht, bleibt der Klon als Rueckfall.]
+  local raw_basis=""
+  local _rurl=${RELEASE_GIT_URL%/}; _rurl=${_rurl%.git}      # ".git" und Schraegstrich am Ende weg
+  if [[ $_rurl =~ ^https?://github\.com/([^/]+)/([^/]+)$ ]]; then
+    raw_basis="https://raw.githubusercontent.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/main"
+  elif [[ $_rurl =~ ^(https?://[^/]+)/(.+)$ ]]; then
+    raw_basis="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/raw/branch/main"
+  fi
+  release_datei_holen() {   # <name> [optional] -> $arbeitsordner/releases/<name>; 0 = da
+    local name=$1 optional=${2:-} ziel="$arbeitsordner/releases/$1"
+    [[ -f $ziel ]] && return 0
+    if [[ -n $raw_basis ]] && command -v curl >/dev/null 2>&1; then
+      if curl -fsSL -m 600 --retry 2 -o "$ziel" "$raw_basis/$name" 2>/dev/null && [[ -s $ziel ]]; then return 0; fi
+      rm -f "$ziel"
+    fi
+    [[ -n $optional ]] && return 1                      # kein Klon fuer eine optionale Datei
+    # Rueckfall: einmaliger Klon, danach liegen alle Dateien da
+    if [[ ! -d "$arbeitsordner/releases/.git" ]]; then
+      log "  --run-only: raw-Abruf nicht moeglich -- klone das Releases-Repo (langsam)"
+      rm -rf "$arbeitsordner/releases"
+      git clone --depth 1 --branch main "$RELEASE_GIT_URL" "$arbeitsordner/releases" -q 2>/dev/null || return 1
+    fi
+    [[ -f $ziel ]]
+  }
+  if ! release_datei_holen release.json; then
     err "  --run-only: Releases-Repo nicht erreichbar ($RELEASE_GIT_URL)"
     return 1
   fi
@@ -4346,10 +4441,11 @@ xbm_release_herunterladen() {     # xbm_release_herunterladen <ziel>
     err "  --run-only: kein Eintrag fuer Plattform '$plattform' in release.json"
     return 1
   fi
-  if [[ ! -f "$arbeitsordner/releases/$dateiname" ]]; then
+  if ! release_datei_holen "$dateiname"; then
     err "  --run-only: '$dateiname' fehlt im Releases-Repo"
     return 1
   fi
+  release_datei_holen "${dateiname}.sha256" optional >/dev/null 2>&1 || true      # Pruefsumme, wenn vorhanden
 
   # PRUEFSUMME VERIFIZIEREN, bevor irgendetwas ausgepackt wird -- ein
   # unbemerkt beschaedigtes oder unvollstaendig hochgeladenes Release
@@ -4484,7 +4580,25 @@ xbm_submodule_reparieren() {
   while IFS= read -r pfad; do
     [[ -z $pfad ]] && continue
     inhalt=$(ls -A "$pfad" 2>/dev/null | grep -v '^\.git$')
-    [[ -n $inhalt ]] && continue          # befuellt -- nichts zu tun
+    if [[ -n $inhalt ]]; then
+      # BEFUELLT -- aber auch SAUBER? [Ein Submodul mit lokal geaenderten
+      #  Dateien ist auf dem Laptop schnell ein GEMISCHTER Stand (z.B.
+      #  markup.cpp aus einer neueren pdfgen-Fassung neben einer alten
+      #  markup.h). Die Bauhosts holen per Git immer den COMMITTETEN Stand
+      #  -- dort baut es, hier nicht, und die Fehlermeldung des Compilers
+      #  verraet nicht, warum nur eine Maschine betroffen ist. Deshalb hier
+      #  eine deutliche Warnung mit den betroffenen Dateien. Der Bau laeuft
+      #  trotzdem weiter: vielleicht ist die Aenderung gewollt.]
+      local geaendert
+      geaendert=$(git -C "$pfad" status --porcelain --untracked-files=no 2>/dev/null | head -n 8)
+      if [[ -n $geaendert ]]; then
+        warn "  Submodul '$pfad' hat LOKALE, nicht committete Aenderungen -- die"
+        warn "    Bauhosts bauen den committeten Stand, dieser Rechner einen anderen:"
+        while IFS= read -r z; do warn "      $z"; done <<< "$geaendert"
+        warn "    Zuruecksetzen: git -C $pfad checkout -- .   |   Uebernehmen: git -C $pfad add -A && git -C $pfad commit"
+      fi
+      continue
+    fi
 
     if [[ -e "$pfad/.git" ]]; then
       log "  Submodul '$pfad': Repository da, aber Arbeitsbaum leer -- hole Auschecken nach"
@@ -4494,8 +4608,11 @@ xbm_submodule_reparieren() {
                         git checkout -f main ; } ) >/dev/null 2>&1 || true
     else
       log "  Submodul '$pfad': fehlt -- wird geholt"
-      git submodule update --init --recursive --depth 1 -- "$pfad" >/dev/null 2>&1 ||
-        git submodule update --init --recursive --remote -- "$pfad" >/dev/null 2>&1 || true
+      eval "$XBM_SM_FN"
+      git submodule sync -q -- "$pfad" 2>/dev/null || true
+      git submodule update --init --depth 1 -- "$pfad" >/dev/null 2>&1 ||
+        git submodule update --init --remote -- "$pfad" >/dev/null 2>&1 || true
+      xbm_sm_holen "$pfad"
       # Auch nach dem Holen kann der Arbeitsbaum leer bleiben (Fall b).
       if [[ -e "$pfad/.git" ]] &&
          [[ -z $(ls -A "$pfad" 2>/dev/null | grep -v '^\.git$') ]]; then
@@ -4712,7 +4829,23 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
       [[ -f "builds/${target}/CMakeCache.txt" ]] &&
         cmake --build "builds/${target}" --target clean 2>/dev/null || true
     fi
-    (( CLEANDEEP )) && rm -rf "builds/${target}"
+    (( CLEANDEEP )) && { rm -rf "builds/${target}"; log "  builds/${target} geloescht"; }
+    if (( CLEANALL )); then
+      # ALLES, was ein Bau je angelegt hat -- ausser den Logs und dem
+      # Status des laufenden Laufs.
+      if [[ -d builds ]]; then
+        find builds -mindepth 1 -maxdepth 1 ! -name logs ! -name '.status' \
+             ! -name '.xbm-lauf.lock' -exec rm -rf {} + 2>/dev/null
+      fi
+      rm -rf .deps-cache
+      log "  builds/ (ohne logs) und .deps-cache geloescht"
+    fi
+    if (( CLEANONLY )); then
+      (( CLEAN || CLEANDEEP || CLEANALL )) || warn "  --clean-only ohne --clean/--clean-deep/--clean-all: nichts zu tun"
+      log "  nur gesaeubert -- kein Bau (--clean-only)"
+      lauf_notiz "${target}@${host}" job "-" ok
+      return 0
+    fi
     if (( IST_EXEC )); then
       if (( DRY_RUN )); then
         echo "  [Probelauf] bash $XBM_EXEC_DATEI"; eval_rc=0
@@ -5260,7 +5393,14 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
   fi
 
   if (( IST_EXEC )); then startskript_bauen ".xbm-run-${XBM_LAUF_ID}.sh" "$target" "$host"; fi
-  if (( ! ZUSAMMENGELEGT )); then
+  if (( ${XBM_TUE_RUN_ONLY:-0} )) && (( ! IST_EXEC )); then
+    # NUR AUSFUEHREN: KEIN PROJEKTABGLEICH. [apk@windows brauchte Minuten --
+    #  fuer "APK aufs Handy installieren" wurde vorher das ganze Projekt per
+    #  Git abgeglichen, samt Submodulen und dem langsamen Rueckfall fuer
+    #  curl/hello_imgui. Der Host braucht dafuer nur build.sh (kommt gleich
+    #  als Werkzeug) und RUN_CMD; das Artefakt holt er aus dem Release.]
+    messpunkt "run-only: Projektabgleich uebersprungen"
+  elif (( ! ZUSAMMENGELEGT )); then
     messpunkt "vor der Uebertragung"
     # Bei --exec nur die Steuerdateien -- den Projektbaum nicht ansehen.
     # [Das war der zweite grosse Posten: xfer_find lief ueber 18500
@@ -5319,6 +5459,8 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
   fi
   (( CLEAN ))          && flags+=(--clean)
   (( CLEANDEEP ))      && flags+=(--clean-deep)
+  (( CLEANALL ))       && flags+=(--clean-all)
+  (( CLEANONLY ))      && flags+=(--clean-only)
 
   local path=${HOST_PATH[$host]}
 
@@ -5509,7 +5651,9 @@ do_one() {                       # do_one <ziel> <host> [ist_exec]
     return 1
   fi
 
-  pull_artifacts "$host" "$target"
+  # Bei --run-only wurde nichts gebaut -- es gibt nichts zurueckzuholen
+  # (das Artefakt stammt aus dem Release und liegt schon hier).
+  if (( ! ${XBM_TUE_RUN_ONLY:-0} )); then pull_artifacts "$host" "$target"; fi
   run_hook post-job "$target" "$host" ok || {
     err "  post-job-Hook fehlgeschlagen (der Bau selbst war erfolgreich)"
     return 1; }
@@ -5640,6 +5784,94 @@ xbm_auftrag_ende() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# LOKALEN STAND AUF DEN GIT-SERVER BRINGEN -- vor jedem Lauf mit entfernten
+# Hosts. [Die Hosts holen das Projekt vom Git-Server. Was nur im Arbeitsbaum
+#  des Laptops liegt, sehen sie NIE: Windows baute tagelang denselben Commit,
+#  waehrend deb@local mit den lokalen Aenderungen laengst gruen war -- und
+#  jeder Lauf scheiterte "schon wieder" am selben, laengst behobenen Fehler.
+#  Deshalb: Submodule mit Aenderungen committen und in IHR Repository pushen
+#  (tiefste zuerst, damit die Eltern die neuen Zeiger mitnehmen), dann das
+#  Hauptprojekt. Scheitert ein Push, wird NICHTS gestartet -- sonst baut
+#  der Host wieder alten Code. --no-push schaltet den Schritt ab.]
+# ---------------------------------------------------------------------------
+xbm_projekt_hochladen() {
+  (( NO_PUSH )) && return 0
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local url; url=$(git config --get remote.origin.url 2>/dev/null)
+  [[ -n $url ]] || { warn "  Projekt hat kein origin -- kein Upload, die Hosts bauen den Server-Stand"; return 0; }
+  local stempel; stempel="build.sh: Stand $(date '+%Y-%m-%d %H:%M')"
+  local -a subs=()
+  # alle Submodule (rekursiv), tiefste zuerst
+  while IFS= read -r p; do [[ -n $p ]] && subs+=("$p"); done < <(git submodule foreach --recursive --quiet 'echo "$displaypath"' 2>/dev/null | awk '{ print gsub(/\//,"/") " " $0 }' | sort -rn | cut -d' ' -f2-)
+  local sm zweig n=0
+  for sm in "${subs[@]}"; do
+    [[ -d $sm/.git || -f $sm/.git ]] || continue
+    # geaenderte oder neue (nicht ignorierte) Dateien im Submodul?
+    if [[ -z $(git -C "$sm" status --porcelain 2>/dev/null) ]]; then continue; fi
+    git -C "$sm" add -A . || return 1
+    git -C "$sm" -c user.name="${XBM_GIT_NAME:-build.sh}" -c user.email="${XBM_GIT_EMAIL:-build@local}" commit -q -m "$stempel" || return 1
+    zweig=$(git -C "$sm" symbolic-ref --short HEAD 2>/dev/null || git -C "$sm" config -f "$(git rev-parse --show-toplevel)/.gitmodules" --get "submodule.$sm.branch" 2>/dev/null || echo main)
+    if ! git -C "$sm" push -q origin "HEAD:refs/heads/$zweig" 2>/tmp/xbm-push.err; then
+      err "  Push des Submoduls $sm nach origin/$zweig fehlgeschlagen:"; sed 's/^/    /' /tmp/xbm-push.err >&2
+      err "  -> nichts gestartet (die Hosts baeuten sonst alten Code). Ohne Upload: --no-push"; return 1
+    fi
+    log "  Submodul $sm: committet und gepusht (origin/$zweig)"; n=$((n+1))
+  done
+  # Hauptprojekt: Aenderungen + neue Zeiger. Bauartefakte und mitgeschickte
+  # Werkzeuge duerfen NIE ins Repository -- .gitignore bekommt fehlende
+  # Eintraege (schuetzt auch Commits von Hand); schon getrackte Artefakte
+  # werden aus dem Index genommen.
+  local _e _neu=0
+  for _e in 'builds/' '.deps-cache/' 'stand.zip' '.stand-liste' 'build.sh' 'publish_release.sh' 'toolchains/' 'build.sh.conf.unreleased'; do
+    grep -qxF -- "$_e" .gitignore 2>/dev/null || grep -qxF -- "/$_e" .gitignore 2>/dev/null || { printf '%s\n' "$_e" >> .gitignore; _neu=1; }
+  done
+  (( _neu )) && log "  .gitignore: Bauartefakte ergaenzt"
+  git rm -r -q --cached --ignore-unmatch builds .deps-cache stand.zip .stand-liste build.sh publish_release.sh toolchains build.sh.conf.unreleased >/dev/null 2>&1 || true
+  git add -A . || return 1
+  if ! git diff --cached --quiet; then
+    git -c user.name="${XBM_GIT_NAME:-build.sh}" -c user.email="${XBM_GIT_EMAIL:-build@local}" commit -q -m "$stempel" || return 1
+    n=$((n+1))
+  fi
+  zweig=$(git symbolic-ref --short HEAD 2>/dev/null || echo main)
+  local lokal fern; lokal=$(git rev-parse HEAD); fern=$(git ls-remote -q origin "refs/heads/$zweig" 2>/dev/null | cut -f1)
+  if [[ $lokal != "$fern" ]]; then
+    if ! git push -q origin "HEAD:refs/heads/$zweig" 2>/tmp/xbm-push.err; then
+      err "  Push nach $url ($zweig) fehlgeschlagen:"; sed 's/^/    /' /tmp/xbm-push.err >&2
+      err "  -> nichts gestartet. Ohne Upload: --no-push"; return 1
+    fi
+    log "  Projekt: Stand ${lokal:0:7} nach $url ($zweig) gepusht -- die Hosts bauen diesen Stand"
+  else
+    log "  Projekt: Server ist auf Stand ${lokal:0:7}"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# GIT-SERVER ERREICHBAR? -- vor dem Lauf, in build.sh statt in einem Hook.
+# [Die Hooks gehoeren den Nutzern (Ton, Nachbauten anstossen); was der Bau
+#  selbst braucht, gehoert hierher. Lief der Server nicht, scheiterten die
+#  Hosts erst nach Minuten mit "Could not connect". Mit XBM_GIT_SERVER_START
+#  in [targets] wird er gestartet und abgewartet.]
+# ---------------------------------------------------------------------------
+xbm_git_server_pruefen() {
+  local url="" h
+  for h in "${HOSTS[@]}"; do [[ $h != local && ${HOST_GIT[$h]:-} =~ ^https?:// ]] && { url=${HOST_GIT[$h]}; break; }; done
+  [[ -n $url ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local probe="$url/info/refs?service=git-upload-pack"
+  _erreichbar() { curl -s -m 4 -o /dev/null -w '%{http_code}' "$probe" 2>/dev/null | grep -qE '^(200|401)$'; }
+  _erreichbar && return 0
+  if [[ -n ${XBM_GIT_SERVER_START:-} ]]; then
+    warn "  Git-Server $url nicht erreichbar -- starte ihn (XBM_GIT_SERVER_START)"
+    eval "$XBM_GIT_SERVER_START" >/dev/null 2>&1 &
+    local i; for i in 1 2 3 4 5 6 7 8; do sleep 1; _erreichbar && { log "  Git-Server laeuft"; return 0; }; done
+  fi
+  err "  Git-Server $url NICHT erreichbar -- die Hosts koennten das Projekt nicht holen."
+  err "  Server starten, oder in build.sh.conf [targets]: XBM_GIT_SERVER_START='<Startbefehl> &'"
+  return 1
+}
+
 run_all() {
   local total=${#TARGETS[@]}
   # SPERRDATEI FUER DIE GANZE LAUFZEIT.
@@ -5657,6 +5889,13 @@ run_all() {
   # [pre-job/post-job laufen je AUFTRAG. Fuer "nur wenn ALLE gelangen"
   #  bzw. "sobald EINER scheitert" braucht es eine Ebene darueber --
   #  sonst muesste ein Hook selbst mitzaehlen, was er gar nicht kann.]
+  # Lokalen Stand hochladen, wenn ein entfernter Host per Git synchronisiert.
+  local _h _fernGit=0
+  for _h in "${HOSTS[@]}"; do [[ $_h != local && -n ${HOST_GIT[$_h]:-} ]] && _fernGit=1; done
+  if (( _fernGit )) && [[ -z ${AS_HOST:-} ]]; then
+    xbm_git_server_pruefen || { err "Git-Server nicht erreichbar -- nichts gestartet"; return 1; }
+    xbm_projekt_hochladen || { err "Upload fehlgeschlagen -- nichts gestartet"; return 1; }
+  fi
   run_hook pre-run "alle" "$DEFAULT_HOST" || {
     err "pre-run-Hook fehlgeschlagen -- nichts gestartet"; return 1; }
   local -a pid=() name=() logf=() host_of=() rc=()
